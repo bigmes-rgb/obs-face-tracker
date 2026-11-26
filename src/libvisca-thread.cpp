@@ -8,6 +8,15 @@
 #include "plugin-macros.generated.h"
 #include "libvisca-thread.hpp"
 #include "libvisca.h"
+#ifdef _WIN32
+#include <winsock.h>
+#endif
+#ifndef _WIN32
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#endif
 
 #define debug(...) // blog(LOG_INFO, __VA_ARGS__)
 
@@ -44,6 +53,34 @@ libvisca_thread::~libvisca_thread()
 	pthread_mutex_destroy(&mutex);
 }
 
+// libvisca waits for the camera's reply with a blocking recv() and no timeout. A single reply lost on
+// the network would then block this thread forever and no further PTZ command would be sent.
+// Give the socket a receive/send timeout so a lost reply is counted as a failure, which the loop
+// below already answers with a reconnect. Also send each small command at once (no Nagle delay).
+// The TCP context of libvisca starts with the socket handle.
+static void tune_tcp_socket(struct _VISCA_interface *iface)
+{
+	if (!iface || !iface->ctx)
+		return;
+#ifdef _WIN32
+	SOCKET fd = *(SOCKET *)iface->ctx;
+	DWORD tv = 700;
+	BOOL one = TRUE;
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
+	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
+#else
+	int fd = *(int *)iface->ctx;
+	struct timeval tv;
+	tv.tv_sec = 0;
+	tv.tv_usec = 700000;
+	int one = 1;
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+#endif
+}
+
 void libvisca_thread::thread_connect()
 {
 	pthread_mutex_lock(&mutex);
@@ -59,8 +96,11 @@ void libvisca_thread::thread_connect()
 	}
 	debug("libvisca_thread::thread_connect connected.");
 	pthread_mutex_unlock(&mutex);
-	if (!iface_new)
+	if (!iface_new) {
+		os_sleep_ms(500); // do not retry in a tight loop while the camera is unreachable
 		return;
+	}
+	tune_tcp_socket(iface_new);
 
 	if (iface) {
 		VISCA_close(iface);
@@ -166,6 +206,7 @@ void libvisca_thread::thread_loop()
 	while (get_ref() > 1) {
 		if (data_changed || n_fail > TH_FAIL) {
 			thread_connect();
+			n_fail = 0;
 			pan_prev = INT_MIN;
 			tilt_prev = INT_MIN;
 			zoom_prev = INT_MIN;

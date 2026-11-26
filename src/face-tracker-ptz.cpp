@@ -215,6 +215,9 @@ static void ftptz_update(void *data, obs_data_t *settings)
 	s->face_lost_ptz_preset = (int)obs_data_get_int(settings, "face_lost_ptz_preset");
 	s->face_lost_zoomout_timeout_ms = (int)(obs_data_get_double(settings, "face_lost_zoomout_timeout") * 1e3);
 
+	int track_fps = (int)obs_data_get_int(settings, "track_fps");
+	s->track_interval_ns = track_fps > 0 ? 1000000000ULL / (uint64_t)track_fps : 0;
+
 	s->debug_faces = obs_data_get_bool(settings, "debug_faces");
 	s->debug_notrack = obs_data_get_bool(settings, "debug_notrack");
 	s->debug_always_show = obs_data_get_bool(settings, "debug_always_show");
@@ -395,6 +398,10 @@ static obs_properties_t *ftptz_properties(void *data)
 		obs_properties_add_float(pp, "track_z", obs_module_text("Zoom"), 0.1, 2.0, 0.05);
 		obs_properties_add_float(pp, "track_x", obs_module_text("X"), -1.0, +1.0, 0.05);
 		obs_properties_add_float(pp, "track_y", obs_module_text("Y"), -1.0, +1.0, 0.05);
+		obs_property_t *p_fps = obs_properties_add_int(pp, "track_fps", obs_module_text("Tracking rate limit"), 0, 60, 1);
+		obs_property_int_set_suffix(p_fps, " fps");
+		obs_property_set_long_description(
+			p_fps, obs_module_text("How many frames per second are analyzed. Lower uses less CPU. 0 analyzes every frame."));
 		obs_properties_add_group(props, "track", obs_module_text("Tracking target location"), OBS_GROUP_NORMAL,
 					 pp);
 	}
@@ -481,6 +488,7 @@ static void ftptz_get_defaults(obs_data_t *settings)
 	face_tracker_manager::get_defaults(settings);
 	obs_data_set_default_double(settings, "tracking_th_dB",
 				    -40.0);                      // overwrite the default from face_tracker_manager
+	obs_data_set_default_int(settings, "track_fps", 12);
 	obs_data_set_default_double(settings, "track_z", 0.25);  // Smaller is preferable for PTZ not to lose the face.
 	obs_data_set_default_double(settings, "track_y", +0.00); // +0.00 +0.10 +0.30
 
@@ -1011,6 +1019,20 @@ static struct obs_source_frame *ftptz_filter_video(void *data, struct obs_source
 		return NULL;
 
 	auto *s = (struct face_tracker_ptz *)data;
+
+	s->known_width = frame->width;
+	s->known_height = frame->height;
+	s->rendered = true;
+
+	// Analyzing every video frame is the main CPU cost of this filter and a pan/tilt head cannot use
+	// position updates that fast. Skip all per-frame work (scaling, copying, tracking) until the next
+	// analysis is due. The control loop keeps running every tick on the latest tracking result.
+	if (s->track_interval_ns) {
+		uint64_t now = os_gettime_ns();
+		if (now - s->last_stage_ns < s->track_interval_ns - s->track_interval_ns / 8)
+			return frame;
+		s->last_stage_ns = now;
+	}
 
 	std::shared_ptr<texture_object> cvtex(new texture_object());
 	cvtex->scale = s->ftm->scale;

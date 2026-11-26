@@ -202,6 +202,7 @@ void libvisca_thread::thread_loop()
 {
 	int pan_prev = INT_MIN, tilt_prev = INT_MIN, zoom_prev = INT_MIN;
 	int n_fail = 0;
+	uint64_t pantilt_sent_ns = 0;
 
 	while (get_ref() > 1) {
 		if (data_changed || n_fail > TH_FAIL) {
@@ -219,8 +220,12 @@ void libvisca_thread::thread_loop()
 		int tilt = os_atomic_load_long(&tilt_rsvd);
 		int zoom = os_atomic_load_long(&zoom_rsvd);
 		bool ptz_changed = false;
-		if (pan != pan_prev || tilt != tilt_prev) {
+		// While the camera is being driven, repeat the command a few times per second so that the
+		// device can stop by itself if this program or the network goes away.
+		bool keepalive = (pan != 0 || tilt != 0) && os_gettime_ns() - pantilt_sent_ns > 400000000ULL;
+		if (pan != pan_prev || tilt != tilt_prev || keepalive) {
 			if (send_pantilt(iface, camera, pan, tilt)) {
+				pantilt_sent_ns = os_gettime_ns();
 				pan_prev = pan;
 				tilt_prev = tilt;
 				ptz_changed = true;

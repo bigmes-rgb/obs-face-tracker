@@ -518,8 +518,9 @@ void face_tracker_manager::get_properties(obs_properties_t *pp)
 	obs_properties_add_float(pp, "upsize_r", obs_module_text("Face box padding: right"), -0.4, 4.0, 0.2);
 	obs_properties_add_float(pp, "upsize_t", obs_module_text("Face box padding: top"), -0.4, 4.0, 0.2);
 	obs_properties_add_float(pp, "upsize_b", obs_module_text("Face box padding: bottom"), -0.4, 4.0, 0.2);
-	obs_properties_add_float(pp, "scale", obs_module_text("Shrink picture before analysing (1 = finds smaller faces, 2 = less CPU)"), 1.0, 16.0,
-				 1.0);
+	obs_properties_add_float(
+		pp, "scale", obs_module_text("Shrink picture before analysing (1 = finds smaller faces, 2 = less CPU)"),
+		1.0, 16.0, 1.0);
 	p = obs_properties_add_list(pp, "detector_engine", obs_module_text("Detector"), OBS_COMBO_TYPE_LIST,
 				    OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(p, obs_module_text("Detector.dlib.hog"), (int)engine_dlib_hog);
@@ -532,18 +533,24 @@ void face_tracker_manager::get_properties(obs_properties_t *pp)
 				"Data Files (*.dat);;"
 				"All Files (*.*)",
 				(data_path + "/" DIR_DLIB_CNN).c_str());
-	p = obs_properties_add_int(pp, "detector_crop_l", obs_module_text("Search area: ignore this much on the left"), 0, 1920, 1);
+	p = obs_properties_add_int(pp, "detector_crop_l", obs_module_text("Search area: ignore this much on the left"),
+				   0, 1920, 1);
 	obs_property_int_set_suffix(p, " px");
-	p = obs_properties_add_int(pp, "detector_crop_r", obs_module_text("Search area: ignore this much on the right"), 0, 1920, 1);
+	p = obs_properties_add_int(pp, "detector_crop_r", obs_module_text("Search area: ignore this much on the right"),
+				   0, 1920, 1);
 	obs_property_int_set_suffix(p, " px");
-	p = obs_properties_add_int(pp, "detector_crop_t", obs_module_text("Search area: ignore this much at the top"), 0, 1080, 1);
+	p = obs_properties_add_int(pp, "detector_crop_t", obs_module_text("Search area: ignore this much at the top"),
+				   0, 1080, 1);
 	obs_property_int_set_suffix(p, " px");
-	p = obs_properties_add_int(pp, "detector_crop_b", obs_module_text("Search area: ignore this much at the bottom"), 0, 1080, 1);
+	p = obs_properties_add_int(pp, "detector_crop_b",
+				   obs_module_text("Search area: ignore this much at the bottom"), 0, 1080, 1);
 	obs_property_int_set_suffix(p, " px");
 	obs_properties_add_bool(pp, "detector_upsample", obs_module_text("Find small faces (HOG only, more CPU)"));
 	p = obs_properties_add_float(pp, "detect_interval", obs_module_text("Detect every"), 0.2, 5.0, 0.1);
 	obs_property_float_set_suffix(p, " s");
-	p = obs_properties_add_float(pp, "lock_hold", obs_module_text("Stay on the same person when the face is hidden, for"), 1.0, 60.0, 1.0);
+	p = obs_properties_add_float(pp, "lock_hold",
+				     obs_module_text("Stay on the same person when the face is hidden, for"), 1.0, 60.0,
+				     1.0);
 	obs_property_float_set_suffix(p, " s");
 	obs_properties_add_bool(pp, "landmark_detection", obs_module_text("Enable landmark detection"));
 	p = obs_properties_add_path(pp, "landmark_detection_data", obs_module_text("Landmark detection data"),

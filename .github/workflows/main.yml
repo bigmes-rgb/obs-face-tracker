@@ -371,3 +371,42 @@ jobs:
           name: test-${{ env.artifactName }}-windows-obs${{ matrix.obs }}-${{ matrix.arch }}
           path: |
             logs/*
+
+  x70_release:
+    # This fork only: publish the Windows installers of the low-cpu branch as a release, so there is one short download link.
+    if: ${{ github.repository == 'bigmes-rgb/obs-face-tracker' && github.event_name == 'pull_request' && github.head_ref == 'low-cpu' }}
+    needs: windows_build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: 'Publish release'
+        run: |
+          gh run download ${{ github.run_id }} --repo ${{ github.repository }} -n artifact-windows-obs30-x64 -D a30
+          gh run download ${{ github.run_id }} --repo ${{ github.repository }} -n artifact-windows-obs33-x64 -D a33
+          cp a30/*Installer.exe FaceTracker-X70-for-OBS-30-31-32.exe
+          cp a33/*Installer.exe FaceTracker-X70-for-OBS-33.exe
+          cat > notes.md <<'NOTES'
+          Modified Face Tracker plugin for the X70 pan/tilt head. Windows only.
+
+          **Which file**
+          - OBS 30, 31 or 32: `FaceTracker-X70-for-OBS-30-31-32.exe`
+          - OBS 33: `FaceTracker-X70-for-OBS-33.exe`
+
+          **Install:** close OBS, run the installer, reopen OBS. Windows may warn about an unknown publisher (More info, then Run anyway).
+
+          **Changes from the original plugin**
+          - Tracking rate limit (default 12 per second) to cut CPU use
+          - Timeout and reconnect on the camera link, so a lost reply no longer stops tracking
+          - Keep-alive while the head is moving
+
+          Based on norihiro/obs-face-tracker (GPL-2.0). Source: the `low-cpu` branch of this repository.
+          NOTES
+          gh release create "x70-${{ github.run_number }}" --repo ${{ github.repository }} \
+            --target "${{ github.event.pull_request.head.sha }}" \
+            --title "Face Tracker for the X70 head (build ${{ github.run_number }})" \
+            --notes-file notes.md --latest \
+            FaceTracker-X70-for-OBS-30-31-32.exe FaceTracker-X70-for-OBS-33.exe

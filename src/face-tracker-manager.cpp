@@ -153,7 +153,8 @@ inline void face_tracker_manager::copy_detector_to_tracker()
 		if (target_confirmed_ns && os_gettime_ns() - target_confirmed_ns > (uint64_t)(lock_hold * 1e9f)) {
 			bool any = false;
 			for (size_t i = 0; i < trackers.size(); i++) {
-				if (trackers[i].state == tracker_inst_s::tracker_state_available && trackers[i].att > 0.0f) {
+				if (trackers[i].state == tracker_inst_s::tracker_state_available &&
+				    trackers[i].att > 0.0f) {
 					trackers[i].att = 0.0f;
 					any = true;
 				}

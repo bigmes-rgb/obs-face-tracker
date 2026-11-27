@@ -183,7 +183,8 @@ inline void face_tracker_manager::stage_to_detector()
 			int ms = (int)((os_gettime_ns() - diag_detect_start_ns) / 1000000);
 			if (detect_rects.size() > 0) {
 				const auto &r = detect_rects[0];
-				blog(LOG_INFO, "detector: %d face(s); first is %dx%d px at (%d,%d) score %.2f; about %d ms",
+				blog(LOG_INFO,
+				     "detector: %d face(s); first is %dx%d px at (%d,%d) score %.2f; about %d ms",
 				     (int)detect_rects.size(), r.x1 - r.x0, r.y1 - r.y0, r.x0, r.y0, r.score, ms);
 			} else {
 				blog(LOG_INFO, "detector: no face found; took about %d ms; %d tracker(s) active", ms,

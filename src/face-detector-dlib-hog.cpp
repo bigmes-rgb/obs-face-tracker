@@ -6,6 +6,7 @@
 #include "texture-object.h"
 
 #include <dlib/image_processing/frontal_face_detector.h>
+#include <dlib/image_transforms.h>
 
 #define MAX_ERROR 2
 
@@ -19,6 +20,7 @@ struct face_detector_dlib_private_s
 	std::string model_filename;
 	int crop_l = 0, crop_r = 0, crop_t = 0, crop_b = 0;
 	int n_error = 0;
+	bool upsample = false;
 	face_detector_dlib_private_s() {}
 	~face_detector_dlib_private_s() {}
 };
@@ -96,14 +98,21 @@ void face_detector_dlib_hog::detect_main()
 	}
 
 	if (!p->has_error) {
+		// The detector needs faces of about 80 px. Enlarging the image 2x first lets it find faces down to
+		// about 40 px, at four times the detection cost.
+		float up = 1.0f;
+		if (p->upsample) {
+			dlib::pyramid_up(img);
+			up = 2.0f;
+		}
 		std::vector<dlib::rectangle> dets = p->detector(img);
 		p->rects.resize(dets.size());
 		for (size_t i = 0; i < dets.size(); i++) {
 			rect_s &r = p->rects[i];
-			r.x0 = (dets[i].left() + x0) * p->tex->scale;
-			r.y0 = (dets[i].top() + y0) * p->tex->scale;
-			r.x1 = (dets[i].right() + x0) * p->tex->scale;
-			r.y1 = (dets[i].bottom() + y0) * p->tex->scale;
+			r.x0 = (dets[i].left() / up + x0) * p->tex->scale;
+			r.y0 = (dets[i].top() / up + y0) * p->tex->scale;
+			r.x1 = (dets[i].right() / up + x0) * p->tex->scale;
+			r.y1 = (dets[i].bottom() / up + y0) * p->tex->scale;
 			r.score = 1.0; // TODO: implement me
 		}
 	}
@@ -122,4 +131,9 @@ void face_detector_dlib_hog::set_model(const char *filename)
 		p->model_filename = filename;
 		p->detector_loaded = false;
 	}
+}
+
+void face_detector_dlib_hog::set_upsample(bool upsample)
+{
+	p->upsample = upsample;
 }

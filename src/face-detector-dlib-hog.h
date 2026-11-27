@@ -16,4 +16,5 @@ public:
 	void get_faces(std::vector<struct rect_s> &) override;
 
 	void set_model(const char *filename);
+	void set_upsample(bool upsample);
 };

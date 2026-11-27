@@ -1037,12 +1037,13 @@ static struct obs_source_frame *ftptz_filter_video(void *data, struct obs_source
 		s->last_stage_ns = now;
 	}
 
-	if (frame->width != s->diag_width || frame->height != s->diag_height || s->ftm->scale != s->diag_scale) {
+	const float diag_scale = s->ftm->scale * (s->ftm->detector_upsample ? 0.5f : 1.0f);
+	if (frame->width != s->diag_width || frame->height != s->diag_height || diag_scale != s->diag_scale) {
 		s->diag_width = frame->width;
 		s->diag_height = frame->height;
-		s->diag_scale = s->ftm->scale;
+		s->diag_scale = diag_scale;
 		blog(LOG_INFO, "analysing %ux%u video (format %d) at scale %.1f: faces must be at least %d px tall",
-		     frame->width, frame->height, (int)frame->format, s->ftm->scale, (int)(80 * s->ftm->scale));
+		     frame->width, frame->height, (int)frame->format, s->ftm->scale, (int)(80 * diag_scale));
 	}
 
 	std::shared_ptr<texture_object> cvtex(new texture_object());

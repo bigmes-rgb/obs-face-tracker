@@ -208,6 +208,8 @@ inline void face_tracker_manager::stage_to_detector()
 		if (detector_engine == engine_dlib_hog) {
 			if (auto *d = dynamic_cast<face_detector_dlib_hog *>(detect))
 				d->set_model(detector_dlib_hog_model.c_str());
+			if (auto *d = dynamic_cast<face_detector_dlib_hog *>(detect))
+				d->set_upsample(detector_upsample);
 		} else if (detector_engine == engine_dlib_cnn) {
 			if (auto *d = dynamic_cast<face_detector_dlib_cnn *>(detect))
 				d->set_model(detector_dlib_cnn_model.c_str());
@@ -403,6 +405,7 @@ void face_tracker_manager::update(obs_data_t *settings)
 	detector_crop_r = obs_data_get_int(settings, "detector_crop_r");
 	detector_crop_t = obs_data_get_int(settings, "detector_crop_t");
 	detector_crop_b = obs_data_get_int(settings, "detector_crop_b");
+	detector_upsample = obs_data_get_bool(settings, "detector_upsample");
 	bool landmark_detection = obs_data_get_bool(settings, "landmark_detection");
 	bfree(landmark_detection_data);
 	landmark_detection_data = NULL;
@@ -448,6 +451,7 @@ void face_tracker_manager::get_properties(obs_properties_t *pp)
 	obs_properties_add_int(pp, "detector_crop_r", obs_module_text("Crop right for detector"), 0, 1920, 1);
 	obs_properties_add_int(pp, "detector_crop_t", obs_module_text("Crop top for detector"), 0, 1080, 1);
 	obs_properties_add_int(pp, "detector_crop_b", obs_module_text("Crop bottom for detector"), 0, 1080, 1);
+	obs_properties_add_bool(pp, "detector_upsample", obs_module_text("Find small faces (HOG only, more CPU)"));
 	obs_properties_add_bool(pp, "landmark_detection", obs_module_text("Enable landmark detection"));
 	p = obs_properties_add_path(pp, "landmark_detection_data", obs_module_text("Landmark detection data"),
 				    OBS_PATH_FILE,

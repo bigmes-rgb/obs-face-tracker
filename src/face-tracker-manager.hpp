@@ -48,6 +48,7 @@ public: // properties
 	std::string detector_dlib_hog_model;
 	std::string detector_dlib_cnn_model;
 	int detector_crop_l, detector_crop_r, detector_crop_t, detector_crop_b;
+	bool detector_upsample = false;
 	char *landmark_detection_data;
 
 public: // realtime status

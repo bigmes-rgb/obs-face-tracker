@@ -148,13 +148,90 @@ inline void face_tracker_manager::copy_detector_to_tracker()
 		return;
 
 	if (detect_rects.size() <= 0) {
+		// Nothing detected. The tracker keeps following by itself, but only for 'lock_hold' seconds: after that
+		// it may have drifted off the person, and a camera that holds still is better than one that wanders.
+		if (target_confirmed_ns && os_gettime_ns() - target_confirmed_ns > (uint64_t)(lock_hold * 1e9f)) {
+			bool any = false;
+			for (size_t i = 0; i < trackers.size(); i++) {
+				if (trackers[i].state == tracker_inst_s::tracker_state_available && trackers[i].att > 0.0f) {
+					trackers[i].att = 0.0f;
+					any = true;
+				}
+			}
+			if (any || diag_target_state != 3)
+				blog(LOG_INFO, "target: no face seen for %.0f s, released (camera holds)", lock_hold);
+			diag_target_state = 3;
+		}
 		retire_tracker(i_tracker);
 		return;
 	}
 
+	// Decide which detected face to follow. The original code always took the first one in the list, so with two
+	// people in shot, or one false detection, the target could jump. Here the current target is kept: a detection
+	// is used only if it overlaps the face already being tracked. If the detector cannot see the target (the person
+	// turned away), the tracker carries on by itself for 'lock_hold' seconds before another face may take over.
+	const uint64_t now_ns = os_gettime_ns();
+	int i_target = -1;
+	float s_target = 0.0f;
+	for (size_t i = 0; i < trackers.size(); i++) {
+		if (trackers[i].state != tracker_inst_s::tracker_state_available)
+			continue;
+		float s = trackers[i].att * trackers[i].rect.score;
+		if (s > s_target) {
+			s_target = s;
+			i_target = (int)i;
+		}
+	}
+
+	size_t i_largest = 0;
+	for (size_t j = 1; j < detect_rects.size(); j++) {
+		const rect_s &a = detect_rects[j], &b = detect_rects[i_largest];
+		if ((a.x1 - a.x0) * (a.y1 - a.y0) > (b.x1 - b.x0) * (b.y1 - b.y0))
+			i_largest = j;
+	}
+
+	size_t i_pick = i_largest;
+	if (i_target >= 0) {
+		const rect_s &tr = trackers[i_target].rect;
+		int a_min = (tr.x1 - tr.x0) * (tr.y1 - tr.y0) / 10;
+		int j_best = -1;
+		for (size_t j = 0; j < detect_rects.size(); j++) {
+			int a = common_area(detect_rects[j], tr);
+			if (a > a_min) {
+				a_min = a;
+				j_best = (int)j;
+			}
+		}
+		if (j_best >= 0) {
+			i_pick = (size_t)j_best;
+			if (diag_target_state != 1)
+				blog(LOG_INFO, "target: confirmed by the detector");
+			diag_target_state = 1;
+		} else if (now_ns - target_confirmed_ns < (uint64_t)(lock_hold * 1e9f)) {
+			if (diag_target_state != 2)
+				blog(LOG_INFO, "target: %d other face(s) seen, staying on the current target",
+				     (int)detect_rects.size());
+			diag_target_state = 2;
+			retire_tracker(i_tracker);
+			return;
+		} else {
+			blog(LOG_INFO, "target: not confirmed for %.0f s, switching to the largest face", lock_hold);
+			diag_target_state = 1;
+			for (size_t i = 0; i < trackers.size(); i++) {
+				if (i != i_tracker && trackers[i].state == tracker_inst_s::tracker_state_available)
+					trackers[i].att = 0.0f;
+			}
+		}
+	} else {
+		if (diag_target_state != 1)
+			blog(LOG_INFO, "target: acquired (largest of %d face(s))", (int)detect_rects.size());
+		diag_target_state = 1;
+	}
+	target_confirmed_ns = now_ns;
+
 	struct tracker_inst_s &t = trackers[i_tracker];
 
-	struct rect_s r = detect_rects[0];
+	struct rect_s r = detect_rects[i_pick];
 	int w = r.x1 - r.x0;
 	int h = r.y1 - r.y0;
 	r.x0 -= w * upsize_l;
@@ -351,7 +428,7 @@ void face_tracker_manager::tick(float second)
 	}
 
 	if (detect_tick == tick_cnt)
-		next_tick_stage_to_detector = tick_cnt + (int)(2.0f / second); // detect for each _ second(s).
+		next_tick_stage_to_detector = tick_cnt + (int)(detect_interval / second);
 
 	tick_cnt += 1;
 
@@ -406,6 +483,12 @@ void face_tracker_manager::update(obs_data_t *settings)
 	detector_crop_t = obs_data_get_int(settings, "detector_crop_t");
 	detector_crop_b = obs_data_get_int(settings, "detector_crop_b");
 	detector_upsample = obs_data_get_bool(settings, "detector_upsample");
+	detect_interval = (float)obs_data_get_double(settings, "detect_interval");
+	if (detect_interval < 0.2f)
+		detect_interval = 0.2f;
+	lock_hold = (float)obs_data_get_double(settings, "lock_hold");
+	if (lock_hold < 1.0f)
+		lock_hold = 1.0f;
 	bool landmark_detection = obs_data_get_bool(settings, "landmark_detection");
 	bfree(landmark_detection_data);
 	landmark_detection_data = NULL;
@@ -452,6 +535,10 @@ void face_tracker_manager::get_properties(obs_properties_t *pp)
 	obs_properties_add_int(pp, "detector_crop_t", obs_module_text("Crop top for detector"), 0, 1080, 1);
 	obs_properties_add_int(pp, "detector_crop_b", obs_module_text("Crop bottom for detector"), 0, 1080, 1);
 	obs_properties_add_bool(pp, "detector_upsample", obs_module_text("Find small faces (HOG only, more CPU)"));
+	p = obs_properties_add_float(pp, "detect_interval", obs_module_text("Detect every"), 0.2, 5.0, 0.1);
+	obs_property_float_set_suffix(p, " s");
+	p = obs_properties_add_float(pp, "lock_hold", obs_module_text("Stay on target for"), 1.0, 60.0, 1.0);
+	obs_property_float_set_suffix(p, " s");
 	obs_properties_add_bool(pp, "landmark_detection", obs_module_text("Enable landmark detection"));
 	p = obs_properties_add_path(pp, "landmark_detection_data", obs_module_text("Landmark detection data"),
 				    OBS_PATH_FILE,
@@ -474,6 +561,8 @@ void face_tracker_manager::get_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, "upsize_t", 0.3);
 	obs_data_set_default_double(settings, "upsize_b", 0.1);
 	obs_data_set_default_double(settings, "scale", 2.0);
+	obs_data_set_default_double(settings, "detect_interval", 1.0);
+	obs_data_set_default_double(settings, "lock_hold", 6.0);
 	obs_data_set_default_bool(settings, "tracking_th_en", true);
 	obs_data_set_default_double(settings, "tracking_th_dB", -80.0);
 

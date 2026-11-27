@@ -49,6 +49,10 @@ public: // properties
 	std::string detector_dlib_cnn_model;
 	int detector_crop_l, detector_crop_r, detector_crop_t, detector_crop_b;
 	bool detector_upsample = false;
+	float detect_interval = 1.0f; // seconds between detector runs
+	float lock_hold = 6.0f;       // seconds to stay on the current target while the detector cannot confirm it
+	uint64_t target_confirmed_ns = 0;
+	int diag_target_state = 0;
 	char *landmark_detection_data;
 
 public: // realtime status

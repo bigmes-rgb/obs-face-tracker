@@ -361,13 +361,39 @@ static bool ptz_type_modified(obs_properties_t *props, obs_property_t *, obs_dat
 	return true;
 }
 
+// Everyday settings are always shown; everything else appears only with "Show advanced settings".
+static bool show_advanced_modified(obs_properties_t *props, obs_property_t *, obs_data_t *settings)
+{
+	static const char *advanced[] = {
+		"preset_grp", "facelost", "upsize_l", "upsize_r", "upsize_t", "upsize_b", "detector_engine",
+		"detector_dlib_hog_model", "detector_dlib_cnn_model", "detector_upsample", "detect_interval",
+		"landmark_detection", "landmark_detection_data", "tracking_th_en", "tracking_th_dB", "track_z",
+		"track_fps", "e_nonlinear_x", "e_nonlinear_y", "Ki_x", "Ki_y", "Td_x", "Td_y", "Tdlpf", "Kp_z_db",
+		"Ki_z", "Td_z", "Tdlpf_z", "e_deadband_z", "e_nonlinear_z", "Tatt_int", "invert_z", NULL,
+	};
+	bool show = obs_data_get_bool(settings, "show_advanced");
+	for (int i = 0; advanced[i]; i++) {
+		obs_property_t *p = obs_properties_get(props, advanced[i]);
+		if (p)
+			obs_property_set_visible(p, show);
+	}
+	if (show) {
+		obs_property_t *p = obs_properties_get(props, "tracking_th_dB");
+		if (p)
+			obs_property_set_visible(p, obs_data_get_bool(settings, "tracking_th_en"));
+	}
+	return true;
+}
+
 static obs_properties_t *ftptz_properties(void *data)
 {
 	auto *s = (struct face_tracker_ptz *)data;
 	obs_properties_t *props;
 	props = obs_properties_create();
 
-	obs_properties_add_button(props, "ftptz_reset_tracking", obs_module_text("Reset tracking"),
+	obs_property_t *p_adv = obs_properties_add_bool(props, "show_advanced", obs_module_text("Show advanced settings"));
+	obs_property_set_modified_callback(p_adv, show_advanced_modified);
+	obs_properties_add_button(props, "ftptz_reset_tracking", obs_module_text("Start over: forget the current target"),
 				  ftptz_reset_tracking);
 
 	{
@@ -390,14 +416,22 @@ static obs_properties_t *ftptz_properties(void *data)
 	{
 		obs_properties_t *pp = obs_properties_create();
 		face_tracker_manager::get_properties(pp);
-		obs_properties_add_group(props, "ftm", obs_module_text("Face detection options"), OBS_GROUP_NORMAL, pp);
+		obs_properties_add_group(props, "ftm", obs_module_text("1. Who to follow (orange box = search area)"),
+					 OBS_GROUP_NORMAL, pp);
 	}
 
 	{
 		obs_properties_t *pp = obs_properties_create();
+		obs_property_t *p;
+		p = obs_properties_add_float_slider(pp, "track_y", obs_module_text("Head room: face higher or lower"), -0.5,
+						    +0.5, 0.01);
+		obs_property_set_long_description(
+			p, obs_module_text("Where the face sits in the picture. 0 = middle. Higher numbers put the face "
+					   "higher, leaving less space above the head. Typical: 0.15 to 0.35. "
+					   "The yellow cross on the preview shows the spot."));
+		p = obs_properties_add_float_slider(pp, "track_x", obs_module_text("Face left or right"), -0.5, +0.5, 0.01);
+		obs_property_set_long_description(p, obs_module_text("0 = centred. Negative = left, positive = right."));
 		obs_properties_add_float(pp, "track_z", obs_module_text("Zoom"), 0.1, 2.0, 0.05);
-		obs_properties_add_float(pp, "track_x", obs_module_text("X"), -1.0, +1.0, 0.05);
-		obs_properties_add_float(pp, "track_y", obs_module_text("Y"), -1.0, +1.0, 0.05);
 		obs_property_t *p_fps =
 			obs_properties_add_int(pp, "track_fps", obs_module_text("Tracking rate limit"), 0, 60, 1);
 		obs_property_int_set_suffix(p_fps, " fps");
@@ -405,35 +439,53 @@ static obs_properties_t *ftptz_properties(void *data)
 			p_fps,
 			obs_module_text(
 				"How many frames per second are analyzed. Lower uses less CPU. 0 analyzes every frame."));
-		obs_properties_add_group(props, "track", obs_module_text("Tracking target location"), OBS_GROUP_NORMAL,
-					 pp);
+		obs_properties_add_group(props, "track", obs_module_text("2. Framing (yellow cross = where the face goes)"),
+					 OBS_GROUP_NORMAL, pp);
 	}
 
 	{
 		obs_properties_t *pp = obs_properties_create();
 		obs_property_t *p;
-		p = obs_properties_add_float(pp, "Kp_x_db", "Track Kp (X)", -40.0, +80.0, 1.0);
+		p = obs_properties_add_float_slider(pp, "Kp_x_db", obs_module_text("Pan speed"), 20.0, 80.0, 1.0);
 		obs_property_float_set_suffix(p, " dB");
-		p = obs_properties_add_float(pp, "Kp_y_db", "Track Kp (Y)", -40.0, +80.0, 1.0);
+		obs_property_set_long_description(
+			p, obs_module_text("How hard the camera chases left and right. Too high: it swings past the "
+					   "person and comes back. Too low: it lags behind. Change 2 or 3 at a time."));
+		p = obs_properties_add_float_slider(pp, "Kp_y_db", obs_module_text("Tilt speed"), 20.0, 80.0, 1.0);
 		obs_property_float_set_suffix(p, " dB");
+		obs_property_set_long_description(
+			p, obs_module_text("Same for up and down. Usually 3 lower than pan speed."));
+		p = obs_properties_add_float_slider(pp, "e_deadband_x", obs_module_text("Still zone, left and right"), 0.0,
+						    20.0, 0.5);
+		obs_property_float_set_suffix(p, " %");
+		obs_property_set_long_description(
+			p, obs_module_text("The camera stays still while the face is inside the yellow box. Bigger = "
+					   "calmer camera, but the person can sit further off-centre. Typical: 1 to 4."));
+		p = obs_properties_add_float_slider(pp, "e_deadband_y", obs_module_text("Still zone, up and down"), 0.0,
+						    20.0, 0.5);
+		obs_property_float_set_suffix(p, " %");
+		obs_property_set_long_description(
+			p, obs_module_text("Bigger stops the camera bobbing when the person nods. Typical: 3 to 8."));
+		p = obs_properties_add_float(pp, "e_nonlinear_x", obs_module_text("Soft edge of still zone, left and right"),
+					     0.0, 50, 0.1);
+		p = obs_properties_add_float(pp, "e_nonlinear_y", obs_module_text("Soft edge of still zone, up and down"),
+					     0.0, 50, 0.1);
+		obs_properties_add_float(pp, "Ki_x", obs_module_text("Pan follow-through (Ki)"), 0.0, 5.0, 0.01);
+		obs_properties_add_float(pp, "Ki_y", obs_module_text("Tilt follow-through (Ki)"), 0.0, 5.0, 0.01);
+		obs_properties_add_float(pp, "Td_x", obs_module_text("Pan quick start (Td)"), 0.0, 5.0, 0.01);
+		obs_properties_add_float(pp, "Td_y", obs_module_text("Tilt quick start (Td)"), 0.0, 5.0, 0.01);
+		obs_properties_add_float(pp, "Tdlpf", obs_module_text("Smoothing"), 0.0, 10.0, 0.1);
 		p = obs_properties_add_float(pp, "Kp_z_db", "Track Kp (Z)", -40.0, +60.0, 1.0);
 		obs_property_float_set_suffix(p, " dB");
-		obs_properties_add_float(pp, "Ki_x", "Track Ki (X)", 0.0, 5.0, 0.01);
-		obs_properties_add_float(pp, "Ki_y", "Track Ki (Y)", 0.0, 5.0, 0.01);
 		obs_properties_add_float(pp, "Ki_z", "Track Ki (Z)", 0.0, 5.0, 0.01);
-		obs_properties_add_float(pp, "Td_x", "Track Td (X)", 0.0, 5.0, 0.01);
-		obs_properties_add_float(pp, "Td_y", "Track Td (Y)", 0.0, 5.0, 0.01);
 		obs_properties_add_float(pp, "Td_z", "Track Td (Z)", 0.0, 5.0, 0.01);
-		obs_properties_add_float(pp, "Tdlpf", "Track LPF for Td (X, Y)", 0.0, 10.0, 0.1);
 		obs_properties_add_float(pp, "Tdlpf_z", "Track LPF for Td (Z)", 0.0, 10.0, 0.1);
-		obs_properties_add_float(pp, "e_deadband_x", "Dead band (X)", 0.0, 50, 0.1);
-		obs_properties_add_float(pp, "e_deadband_y", "Dead band (Y)", 0.0, 50, 0.1);
 		obs_properties_add_float(pp, "e_deadband_z", "Dead band (Z)", 0.0, 50, 0.1);
-		obs_properties_add_float(pp, "e_nonlinear_x", "Nonlinear band (X)", 0.0, 50, 0.1);
-		obs_properties_add_float(pp, "e_nonlinear_y", "Nonlinear band (Y)", 0.0, 50, 0.1);
 		obs_properties_add_float(pp, "e_nonlinear_z", "Nonlinear band (Z)", 0.0, 50, 0.1);
 		obs_properties_add_float(pp, "Tatt_int", "Attenuation time for lost face", 0.0, 4.0, 0.5);
-		obs_properties_add_group(props, "ctrl", obs_module_text("Tracking response"), OBS_GROUP_NORMAL, pp);
+		obs_properties_add_group(props, "ctrl",
+					 obs_module_text("3. Camera movement (yellow box = still zone)"),
+					 OBS_GROUP_NORMAL, pp);
 	}
 
 	{
@@ -460,16 +512,16 @@ static obs_properties_t *ftptz_properties(void *data)
 #endif // WITH_PTZ_TCP
 		obs_property_set_modified_callback(p, ptz_type_modified);
 
-		obs_properties_add_bool(pp, "invert_x", obs_module_text("Invert control (Pan)"));
-		obs_properties_add_bool(pp, "invert_y", obs_module_text("Invert control (Tilt)"));
+		obs_properties_add_bool(pp, "invert_x", obs_module_text("Camera turns the wrong way left / right: reverse"));
+		obs_properties_add_bool(pp, "invert_y", obs_module_text("Camera turns the wrong way up / down: reverse"));
 		obs_properties_add_bool(pp, "invert_z", obs_module_text("Invert control (Zoom)"));
-		obs_properties_add_group(props, "output", obs_module_text("Output"), OBS_GROUP_NORMAL, pp);
+		obs_properties_add_group(props, "output", obs_module_text("4. Connection to the head"), OBS_GROUP_NORMAL, pp);
 	}
 
 	{
 		obs_properties_t *pp = obs_properties_create();
-		obs_properties_add_bool(pp, "debug_faces", "Show face detection results");
-		obs_properties_add_bool(pp, "debug_always_show", "Always show information (useful for demo)");
+		obs_properties_add_bool(pp, "debug_faces", "Show the coloured boxes in this window");
+		obs_properties_add_bool(pp, "debug_always_show", "Show them on the main OBS preview too (they are never recorded or streamed)");
 #ifdef ENABLE_DEBUG_DATA
 		obs_properties_add_path(pp, "debug_data_tracker", "Save correlation tracker data to file",
 					OBS_PATH_FILE_SAVE, DEBUG_DATA_PATH_FILTER, NULL);
@@ -478,7 +530,15 @@ static obs_properties_t *ftptz_properties(void *data)
 		obs_properties_add_path(pp, "debug_data_control", "Save control data to file", OBS_PATH_FILE_SAVE,
 					DEBUG_DATA_PATH_FILTER, NULL);
 #endif
-		obs_properties_add_group(props, "debug", obs_module_text("Debugging"), OBS_GROUP_NORMAL, pp);
+		obs_properties_add_group(props, "debug",
+					 obs_module_text("5. Boxes on the preview: blue = face found, green = face followed"),
+					 OBS_GROUP_NORMAL, pp);
+	}
+
+	obs_data_t *cur = obs_source_get_settings(s->context);
+	if (cur) {
+		show_advanced_modified(props, NULL, cur);
+		obs_data_release(cur);
 	}
 
 	return props;
@@ -1084,6 +1144,17 @@ static struct obs_source_frame *ftptz_filter_video(void *data, struct obs_source
 	return frame;
 }
 
+static void draw_box(float x0, float y0, float x1, float y1)
+{
+	gs_render_start(false);
+	gs_vertex2f(x0, y0);
+	gs_vertex2f(x1, y0);
+	gs_vertex2f(x1, y1);
+	gs_vertex2f(x0, y1);
+	gs_vertex2f(x0, y0);
+	gs_render_stop(GS_LINESTRIP);
+}
+
 static void draw_frame_info(struct face_tracker_ptz *s, bool landmark_only = false)
 {
 	bool draw_det = !landmark_only;
@@ -1119,6 +1190,24 @@ static void draw_frame_info(struct face_tracker_ptz *s, bool landmark_only = fal
 			gs_vertex2f(rcx, rcy - srwhr2 * s->track_z);
 			gs_vertex2f(rcx, rcy + srwhr2 * s->track_z);
 			gs_render_stop(GS_LINES);
+
+			// Still zone (yellow box): the camera does not move while the middle of the face is inside it.
+			const float still_x = srwhr2 * 2.0f * s->e_deadband.v[0];
+			const float still_y = srwhr2 * 2.0f * s->e_deadband.v[1];
+			if (still_x > 0.0f && still_y > 0.0f)
+				draw_box(rcx - still_x, rcy - still_y, rcx + still_x, rcy + still_y);
+
+			// Search area (orange box, drawn double): faces are only looked for inside it.
+			gs_effect_set_color(gs_effect_get_param_by_name(effect, "color"), 0xFFFF8800);
+			const float sx0 = (float)s->ftm->detector_crop_l;
+			const float sy0 = (float)s->ftm->detector_crop_t;
+			const float sx1 = (float)s->known_width - (float)s->ftm->detector_crop_r;
+			const float sy1 = (float)s->known_height - (float)s->ftm->detector_crop_b;
+			if (sx1 - sx0 > 8.0f && sy1 - sy0 > 8.0f) {
+				draw_box(sx0 + 1.0f, sy0 + 1.0f, sx1 - 1.0f, sy1 - 1.0f);
+				draw_box(sx0 + 4.0f, sy0 + 4.0f, sx1 - 4.0f, sy1 - 4.0f);
+			}
+			gs_effect_set_color(gs_effect_get_param_by_name(effect, "color"), 0xFFFFFF00);
 
 			if (s->ftm->landmark_detection_data) {
 				gs_render_start(false);

@@ -1042,6 +1042,8 @@ static struct obs_source_frame *ftptz_filter_video(void *data, struct obs_source
 		s->diag_width = frame->width;
 		s->diag_height = frame->height;
 		s->diag_scale = diag_scale;
+		// trackers started on the old picture size cannot continue on the new one
+		s->ftm->reset_requested = true;
 		blog(LOG_INFO, "analysing %ux%u video (format %d) at scale %.1f: faces must be at least %d px tall",
 		     frame->width, frame->height, (int)frame->format, s->ftm->scale, (int)(80 * diag_scale));
 	}

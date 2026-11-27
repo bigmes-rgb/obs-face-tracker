@@ -491,22 +491,32 @@ static void ftptz_get_defaults(obs_data_t *settings)
 	face_tracker_manager::get_defaults(settings);
 	obs_data_set_default_double(settings, "tracking_th_dB",
 				    -40.0); // overwrite the default from face_tracker_manager
+	// Defaults of this fork: the X70 pan/tilt head (x70head.local), a 1080p camera about 20 m from the stage,
+	// full-body framing, OBS at 30 fps and the head's tracking speed scale at 0.2.
 	obs_data_set_default_int(settings, "track_fps", 12);
-	obs_data_set_default_double(settings, "track_z", 0.25);  // Smaller is preferable for PTZ not to lose the face.
-	obs_data_set_default_double(settings, "track_y", +0.00); // +0.00 +0.10 +0.30
+	obs_data_set_default_double(settings, "scale", 1.0);
+	obs_data_set_default_double(settings, "lock_hold", 10.0);
+	obs_data_set_default_int(settings, "detector_crop_b", 300);
+	obs_data_set_default_double(settings, "track_z", 0.25);
+	obs_data_set_default_double(settings, "track_y", 0.25);
 
-	obs_data_set_default_double(settings, "Kp_x_db", 50.0);
-	obs_data_set_default_double(settings, "Kp_y_db", 50.0);
-	obs_data_set_default_double(settings, "Kp_z_db", 40.0);
-	obs_data_set_default_double(settings, "Ki_x", 0.3);
-	obs_data_set_default_double(settings, "Ki_y", 0.3);
-	obs_data_set_default_double(settings, "Ki_z", 0.1);
-	obs_data_set_default_double(settings, "Td_x", 0.42);
-	obs_data_set_default_double(settings, "Td_y", 0.42);
-	obs_data_set_default_double(settings, "Td_z", 0.14);
+	obs_data_set_default_double(settings, "Kp_x_db", 62.0);
+	obs_data_set_default_double(settings, "Kp_y_db", 59.0);
+	obs_data_set_default_double(settings, "Kp_z_db", -40.0);
+	obs_data_set_default_double(settings, "Ki_x", 0.2);
+	obs_data_set_default_double(settings, "Ki_y", 0.2);
+	obs_data_set_default_double(settings, "Ki_z", 0.0);
+	obs_data_set_default_double(settings, "Td_x", 0.25);
+	obs_data_set_default_double(settings, "Td_y", 0.25);
+	obs_data_set_default_double(settings, "Td_z", 0.0);
 	obs_data_set_default_double(settings, "Tdlpf", 2.0);
 	obs_data_set_default_double(settings, "Tdlpf_z", 6.0);
 	obs_data_set_default_double(settings, "Tatt_int", 2.0);
+	obs_data_set_default_double(settings, "e_deadband_x", 2.0);
+	obs_data_set_default_double(settings, "e_nonlinear_x", 4.0);
+	obs_data_set_default_double(settings, "e_deadband_y", 4.0);
+	obs_data_set_default_double(settings, "e_nonlinear_y", 6.0);
+	obs_data_set_default_double(settings, "e_deadband_z", 50.0);
 
 	obs_data_set_default_double(settings, "face_lost_preset_timeout", 5.0);
 	obs_data_set_default_int(settings, "face_lost_ptz_preset", -1);
@@ -516,8 +526,9 @@ static void ftptz_get_defaults(obs_data_t *settings)
 	obs_data_set_default_obj(settings, "presets", presets);
 	obs_data_release(presets);
 
-	obs_data_set_default_string(settings, "ptz-type", "obsptz");
-	obs_data_set_default_int(settings, "ptz.visca-over-tcp.port", 1259);
+	obs_data_set_default_string(settings, "ptz-type", "visca-over-tcp");
+	obs_data_set_default_string(settings, "ptz.visca-over-tcp.address", "x70head.local");
+	obs_data_set_default_int(settings, "ptz.visca-over-tcp.port", 5678);
 	obs_data_set_default_int(settings, "ptz.obsptz.max_x", PTZ_MAX_X);
 	obs_data_set_default_int(settings, "ptz.obsptz.max_y", PTZ_MAX_Y);
 	obs_data_set_default_int(settings, "ptz.obsptz.max_z", PTZ_MAX_Z);

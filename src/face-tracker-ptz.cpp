@@ -1037,6 +1037,14 @@ static struct obs_source_frame *ftptz_filter_video(void *data, struct obs_source
 		s->last_stage_ns = now;
 	}
 
+	if (frame->width != s->diag_width || frame->height != s->diag_height || s->ftm->scale != s->diag_scale) {
+		s->diag_width = frame->width;
+		s->diag_height = frame->height;
+		s->diag_scale = s->ftm->scale;
+		blog(LOG_INFO, "analysing %ux%u video (format %d) at scale %.1f: faces must be at least %d px tall",
+		     frame->width, frame->height, (int)frame->format, s->ftm->scale, (int)(80 * s->ftm->scale));
+	}
+
 	std::shared_ptr<texture_object> cvtex(new texture_object());
 	cvtex->scale = s->ftm->scale;
 	cvtex->tick = s->ftm->tick_cnt;

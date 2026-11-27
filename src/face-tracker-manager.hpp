@@ -69,6 +69,10 @@ public: /* not sure they are necessary to be public */
 private:
 	int next_tick_stage_to_detector;
 	bool detector_in_progress;
+	// diagnostics written to the OBS log
+	int diag_last_faces = -1;
+	int diag_last_tick = 0;
+	uint64_t diag_detect_start_ns = 0;
 
 public:
 	face_tracker_manager();

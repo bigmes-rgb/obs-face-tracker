@@ -1,3 +1,4 @@
+#include <util/platform.h>
 #include <obs-module.h>
 #include "plugin-macros.generated.h"
 #include "face-tracker-manager.hpp"
@@ -177,6 +178,20 @@ inline void face_tracker_manager::stage_to_detector()
 		for (size_t i = 0; i < detect_rects.size(); i++)
 			debug_detect("stage_to_detector: detect_rects %d %d %d %d %d %f", i, detect_rects[i].x0,
 				     detect_rects[i].y0, detect_rects[i].x1, detect_rects[i].y1, detect_rects[i].score);
+		// Diagnostics: report what the detector found whenever the count changes, and about every 20 s.
+		if ((int)detect_rects.size() != diag_last_faces || tick_cnt - diag_last_tick > 600) {
+			int ms = (int)((os_gettime_ns() - diag_detect_start_ns) / 1000000);
+			if (detect_rects.size() > 0) {
+				const auto &r = detect_rects[0];
+				blog(LOG_INFO, "detector: %d face(s); first is %dx%d px at (%d,%d) score %.2f; about %d ms",
+				     (int)detect_rects.size(), r.x1 - r.x0, r.y1 - r.y0, r.x0, r.y0, r.score, ms);
+			} else {
+				blog(LOG_INFO, "detector: no face found; took about %d ms; %d tracker(s) active", ms,
+				     (int)tracker_rects.size());
+			}
+			diag_last_faces = (int)detect_rects.size();
+			diag_last_tick = tick_cnt;
+		}
 		attenuate_tracker();
 		copy_detector_to_tracker();
 		detector_in_progress = false;
@@ -197,6 +212,7 @@ inline void face_tracker_manager::stage_to_detector()
 				d->set_model(detector_dlib_cnn_model.c_str());
 		}
 		detect->signal();
+		diag_detect_start_ns = os_gettime_ns();
 		detector_in_progress = true;
 		detect_tick = tick_cnt;
 

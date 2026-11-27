@@ -12,6 +12,8 @@ struct face_tracker_ptz
 	bool rendered;
 	uint64_t track_interval_ns; // minimum time between frames handed to the detector/trackers; 0 = every frame
 	uint64_t last_stage_ns;
+	uint32_t diag_width, diag_height;
+	float diag_scale;
 	bool is_active;
 
 	video_scaler_t *scaler;

@@ -202,6 +202,9 @@ static void ftptz_update(void *data, obs_data_t *settings)
 	s->klpf.v[2] = obs_data_get_double(settings, "Td_z");
 	s->tlpf.v[0] = s->tlpf.v[1] = (float)obs_data_get_double(settings, "Tdlpf");
 	s->tlpf.v[2] = (float)obs_data_get_double(settings, "Tdlpf_z");
+	s->zone_mode = obs_data_get_bool(settings, "zone_mode");
+	s->zone_x = (float)obs_data_get_double(settings, "zone_x") * 1e-2f;
+	s->zone_y = (float)obs_data_get_double(settings, "zone_y") * 1e-2f;
 	s->e_deadband.v[0] = (float)obs_data_get_double(settings, "e_deadband_x") * 1e-2;
 	s->e_deadband.v[1] = (float)obs_data_get_double(settings, "e_deadband_y") * 1e-2;
 	s->e_deadband.v[2] = (float)obs_data_get_double(settings, "e_deadband_z") * 1e-2;
@@ -371,8 +374,10 @@ static bool show_advanced_modified(obs_properties_t *props, obs_property_t *, ob
 		"upsize_r",
 		"upsize_t",
 		"upsize_b",
-		"detector_engine",
 		"detector_dlib_hog_model",
+		"person_interval",
+		"e_deadband_x",
+		"e_deadband_y",
 		"detector_dlib_cnn_model",
 		"detector_upsample",
 		"detect_interval",
@@ -445,8 +450,11 @@ static obs_properties_t *ftptz_properties(void *data)
 	{
 		obs_properties_t *pp = obs_properties_create();
 		face_tracker_manager::get_properties(pp);
-		obs_properties_add_group(props, "ftm", obs_module_text("1. Who to follow (orange box = search area)"),
-					 OBS_GROUP_NORMAL, pp);
+		obs_properties_add_group(
+			props, "ftm",
+			obs_module_text(
+				"1. Who to follow (orange box = search area, blue = people found, green = the head being followed)"),
+			OBS_GROUP_NORMAL, pp);
 	}
 
 	{
@@ -488,6 +496,22 @@ static obs_properties_t *ftptz_properties(void *data)
 		obs_property_float_set_suffix(p, " dB");
 		obs_property_set_long_description(
 			p, obs_module_text("Same for up and down. Usually 3 lower than pan speed."));
+		p = obs_properties_add_bool(pp, "zone_mode",
+					    obs_module_text("Rest while the person is near the middle (zone framing)"));
+		obs_property_set_long_description(
+			p,
+			obs_module_text("On: the camera holds still while the head is inside the big yellow box. "
+					"When the head leaves the box, the camera brings the person back to the middle "
+					"and rests again. Off: the camera corrects all the time."));
+		p = obs_properties_add_float_slider(pp, "zone_x", obs_module_text("Rest zone, left and right"), 2.0,
+						    40.0, 1.0);
+		obs_property_float_set_suffix(p, " % of the width");
+		obs_property_set_long_description(
+			p, obs_module_text("How far to each side the person may move before the camera follows. Bigger "
+					   "= calmer camera. Typical: 8 to 15."));
+		p = obs_properties_add_float_slider(pp, "zone_y", obs_module_text("Rest zone, up and down"), 2.0, 40.0,
+						    1.0);
+		obs_property_float_set_suffix(p, " % of the height");
 		p = obs_properties_add_float_slider(pp, "e_deadband_x", obs_module_text("Still zone, left and right"),
 						    0.0, 20.0, 0.5);
 		obs_property_float_set_suffix(p, " %");
@@ -517,7 +541,7 @@ static obs_properties_t *ftptz_properties(void *data)
 		obs_properties_add_float(pp, "e_deadband_z", "Dead band (Z)", 0.0, 50, 0.1);
 		obs_properties_add_float(pp, "e_nonlinear_z", "Nonlinear band (Z)", 0.0, 50, 0.1);
 		obs_properties_add_float(pp, "Tatt_int", "Attenuation time for lost face", 0.0, 4.0, 0.5);
-		obs_properties_add_group(props, "ctrl", obs_module_text("3. Camera movement (yellow box = still zone)"),
+		obs_properties_add_group(props, "ctrl", obs_module_text("3. Camera movement (yellow box = rest zone)"),
 					 OBS_GROUP_NORMAL, pp);
 	}
 
@@ -610,6 +634,13 @@ static void ftptz_get_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, "Tdlpf", 2.0);
 	obs_data_set_default_double(settings, "Tdlpf_z", 6.0);
 	obs_data_set_default_double(settings, "Tatt_int", 2.0);
+	obs_data_set_default_bool(settings, "zone_mode", true);
+	obs_data_set_default_double(settings, "zone_x", 10.0);
+	obs_data_set_default_double(settings, "zone_y", 10.0);
+	if (face_tracker_manager::person_engine_available()) {
+		obs_data_set_default_int(settings, "detector_engine", (int)face_tracker_manager::engine_person);
+		obs_data_set_default_double(settings, "scale", 2.0); // a whole person is big: half size is plenty
+	}
 	obs_data_set_default_double(settings, "e_deadband_x", 2.0);
 	obs_data_set_default_double(settings, "e_nonlinear_x", 4.0);
 	obs_data_set_default_double(settings, "e_deadband_y", 4.0);
@@ -806,6 +837,25 @@ static void tick_filter(struct face_tracker_ptz *s, float second)
 	f3 e_int = e;
 	for (int i = 0; i < 3; i++) {
 		float x = e.v[i];
+		if (s->zone_mode && i < 2) {
+			// Rest until the presenter leaves the rest zone, then bring them all the way back to the middle.
+			const float outer = i == 0 ? s->zone_x * (float)s->known_width
+						   : s->zone_y * (float)s->known_height;
+			const float inner = outer * 0.3f;
+			if (!s->face_found)
+				s->zone_moving[i] = false;
+			else if (!s->zone_moving[i] && std::abs(x) > outer)
+				s->zone_moving[i] = true;
+			else if (s->zone_moving[i] && std::abs(x) < inner)
+				s->zone_moving[i] = false;
+			if (!s->zone_moving[i]) {
+				x = 0.0f;
+				s->filter_int.v[i] = 0.0f;
+			}
+			e_int.v[i] = x;
+			e.v[i] = x;
+			continue;
+		}
 		float d = srwh * s->e_deadband.v[i];
 		float n = srwh * s->e_nonlinear.v[i];
 		if (std::abs(x) <= d)
@@ -1203,9 +1253,16 @@ static void draw_frame_info(struct face_tracker_ptz *s, bool landmark_only = fal
 	while (gs_effect_loop(effect, "Solid")) {
 		if (draw_det) {
 			gs_effect_set_color(gs_effect_get_param_by_name(effect, "color"), 0xFF0000FF);
-			for (size_t i = 0; i < s->ftm->detect_rects.size(); i++)
-				draw_rect_upsize(s->ftm->detect_rects[i], s->ftm->upsize_l, s->ftm->upsize_r,
-						 s->ftm->upsize_t, s->ftm->upsize_b);
+			const bool person = s->ftm->detector_engine == face_tracker_manager::engine_person;
+			for (size_t i = 0; i < s->ftm->detect_rects.size(); i++) {
+				if (person && s->ftm->detect_rects[i].score < 0.3f)
+					continue;
+				if (person)
+					draw_rect_upsize(s->ftm->detect_rects[i]);
+				else
+					draw_rect_upsize(s->ftm->detect_rects[i], s->ftm->upsize_l, s->ftm->upsize_r,
+							 s->ftm->upsize_t, s->ftm->upsize_b);
+			}
 		}
 
 		gs_effect_set_color(gs_effect_get_param_by_name(effect, "color"), 0xFF00FF00);
@@ -1230,8 +1287,16 @@ static void draw_frame_info(struct face_tracker_ptz *s, bool landmark_only = fal
 			gs_render_stop(GS_LINES);
 
 			// Still zone (yellow box): the camera does not move while the middle of the face is inside it.
-			const float still_x = srwhr2 * 2.0f * s->e_deadband.v[0];
-			const float still_y = srwhr2 * 2.0f * s->e_deadband.v[1];
+			float still_x = srwhr2 * 2.0f * s->e_deadband.v[0];
+			float still_y = srwhr2 * 2.0f * s->e_deadband.v[1];
+			if (s->zone_mode) {
+				// Rest zone (big yellow box) and settle zone (small one): the camera starts moving when the
+				// head leaves the big box and stops once it is back inside the small one.
+				still_x = s->zone_x * (float)s->known_width;
+				still_y = s->zone_y * (float)s->known_height;
+				draw_box(rcx - still_x * 0.3f, rcy - still_y * 0.3f, rcx + still_x * 0.3f,
+					 rcy + still_y * 0.3f);
+			}
 			if (still_x > 0.0f && still_y > 0.0f)
 				draw_box(rcx - still_x, rcy - still_y, rcx + still_x, rcy + still_y);
 

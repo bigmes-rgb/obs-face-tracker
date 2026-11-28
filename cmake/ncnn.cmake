@@ -1,0 +1,29 @@
+# ncnn: a small neural-network library (BSD 3-clause) built into the plugin, with no extra DLL to ship.
+# It runs the person detector on the CPU.
+include(FetchContent)
+set(NCNN_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+set(NCNN_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(NCNN_BUILD_BENCHMARK OFF CACHE BOOL "" FORCE)
+set(NCNN_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(NCNN_VULKAN OFF CACHE BOOL "" FORCE)
+set(NCNN_OPENMP OFF CACHE BOOL "" FORCE)
+set(NCNN_SIMPLEOMP OFF CACHE BOOL "" FORCE)
+set(NCNN_SHARED_LIB OFF CACHE BOOL "" FORCE)
+set(NCNN_INSTALL_SDK OFF CACHE BOOL "" FORCE)
+set(NCNN_PYTHON OFF CACHE BOOL "" FORCE)
+set(NCNN_SIMPLEOCV OFF CACHE BOOL "" FORCE)
+set(NCNN_DISABLE_RTTI OFF CACHE BOOL "" FORCE)
+set(NCNN_DISABLE_EXCEPTION OFF CACHE BOOL "" FORCE)
+set(NCNN_PIXEL_DRAWING OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(ncnn
+	GIT_REPOSITORY https://github.com/Tencent/ncnn.git
+	GIT_TAG 20250503
+	GIT_SHALLOW TRUE
+)
+set(_x70_saved_build_shared ${BUILD_SHARED_LIBS})
+set(BUILD_SHARED_LIBS OFF)
+FetchContent_MakeAvailable(ncnn)
+set(BUILD_SHARED_LIBS ${_x70_saved_build_shared})
+if(NOT MSVC)
+	set_target_properties(ncnn PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()

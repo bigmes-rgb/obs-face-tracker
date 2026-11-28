@@ -3,12 +3,14 @@
 #include <deque>
 #include <string>
 #include "face-tracker-base.h"
+#include "presenter-tracker.hpp"
 
 class face_tracker_manager {
 public:
 	enum detector_engine_e {
 		engine_dlib_hog = 0,
 		engine_dlib_cnn = 1,
+		engine_person = 2, // whole-body detection with a presenter lock (needs WITH_NCNN)
 		engine_uninitialized = -1,
 	};
 
@@ -53,6 +55,12 @@ public: // properties
 	float lock_hold = 6.0f;       // seconds to stay on the current target while the detector cannot confirm it
 	uint64_t target_confirmed_ns = 0;
 	int diag_target_state = 0;
+	// person engine
+	std::string person_model;      // "tiny" (accurate) or "nano" (fast)
+	float person_interval = 0.15f; // seconds between detector runs
+	presenter_tracker presenter;
+	double presenter_det_time = 0.0; // when the picture now in the detector was taken
+	static bool person_engine_available();
 	char *landmark_detection_data;
 
 public: // realtime status

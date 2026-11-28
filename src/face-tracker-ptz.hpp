@@ -33,6 +33,11 @@ struct face_tracker_ptz
 	f3 klpf;
 	f3 tlpf;
 	f3 e_deadband, e_nonlinear; // deadband and nonlinear amount for error input
+	// Zone framing: the camera rests while the presenter is inside the rest zone around the target point. When
+	// they leave it, the camera brings them back to the middle (inside the small settle zone) and rests again.
+	bool zone_mode;
+	float zone_x, zone_y; // half size of the rest zone, as a fraction of the picture width / height
+	bool zone_moving[2];  // pan, tilt: currently bringing the presenter back
 	f3 filter_int;
 	f3 filter_lpf;
 	float f_att_int;

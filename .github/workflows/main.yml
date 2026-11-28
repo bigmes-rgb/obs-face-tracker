@@ -75,6 +75,7 @@ jobs:
             -D CMAKE_BUILD_TYPE=RelWithDebInfo \
             -D CPACK_DEBIAN_PACKAGE_SHLIBDEPS=ON \
             -D PKG_SUFFIX=-obs${{ matrix.obs }}-${{ matrix.ubuntu }}-x86_64 \
+            -D WITH_NCNN=ON \
             ${{ steps.obsdeps.outputs.PLUGIN_CMAKE_OPTIONS }}
           cd build
           make -j4

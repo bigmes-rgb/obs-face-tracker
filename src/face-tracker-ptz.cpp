@@ -69,6 +69,43 @@ public:
 
 static void lock_on_person_at_cross(struct face_tracker_ptz *s);
 
+// The everyday settings are named choices. Each stands for a number; "custom" uses the number set under Advanced.
+struct choice_s
+{
+	const char *name;
+	double value;
+};
+static const choice_s ch_headroom[] = {{"tight", 18.0}, {"normal", 25.0}, {"generous", 32.0}, {NULL, 0}};
+static const choice_s ch_lead[] = {{"off", 0.0}, {"some", 5.0}, {"more", 9.0}, {NULL, 0}};
+static const choice_s ch_sens_w[] = {{"high", 12.0}, {"medium", 20.0}, {"low", 32.0}, {NULL, 0}};
+static const choice_s ch_sens_h[] = {{"high", 12.0}, {"medium", 20.0}, {"low", 28.0}, {NULL, 0}};
+static const choice_s ch_seats[] = {{"none", 0.0}, {"low", 15.0}, {"medium", 28.0}, {"high", 40.0}, {NULL, 0}};
+
+static double choice_value(obs_data_t *settings, const char *choice_key, const choice_s *table, const char *number_key)
+{
+	const char *c = obs_data_get_string(settings, choice_key);
+	for (int i = 0; table[i].name; i++)
+		if (strcmp(c, table[i].name) == 0)
+			return table[i].value;
+	return obs_data_get_double(settings, number_key);
+}
+
+// Settings from an older build: pick the named choice that matches the stored number, or "custom".
+static void choice_from_number(obs_data_t *settings, const char *choice_key, const choice_s *table,
+			       const char *number_key)
+{
+	if (obs_data_has_user_value(settings, choice_key) || !obs_data_has_user_value(settings, number_key))
+		return;
+	const double v = obs_data_get_double(settings, number_key);
+	for (int i = 0; table[i].name; i++) {
+		if (fabs(v - table[i].value) <= 1.5) {
+			obs_data_set_string(settings, choice_key, table[i].name);
+			return;
+		}
+	}
+	obs_data_set_string(settings, choice_key, "custom");
+}
+
 static const char *ftptz_get_name(void *unused)
 {
 	UNUSED_PARAMETER(unused);
@@ -211,14 +248,22 @@ static void ftptz_update(void *data, obs_data_t *settings)
 		}
 		obs_data_set_bool(settings, "ui_v2", true);
 	}
+	if (!obs_data_get_bool(settings, "ui_v3")) {
+		choice_from_number(settings, "headroom", ch_headroom, "head_top_pct");
+		choice_from_number(settings, "lead", ch_lead, "lead_pct");
+		choice_from_number(settings, "sensitivity", ch_sens_w, "zone_w_pct");
+		choice_from_number(settings, "seats", ch_seats, "search_b_pct");
+		obs_data_set_bool(settings, "ui_v3", true);
+	}
 	s->track_x = obs_data_get_double(settings, "head_left_pct") * 0.01 - 0.5;
-	s->track_y = 0.5 - obs_data_get_double(settings, "head_top_pct") * 0.01;
+	s->track_y = 0.5 - choice_value(settings, "headroom", ch_headroom, "head_top_pct") * 0.01;
+	s->pan_only = strcmp(obs_data_get_string(settings, "scope"), "pan") == 0;
 	s->search_pct[0] = (float)obs_data_get_double(settings, "search_l_pct");
 	s->search_pct[1] = (float)obs_data_get_double(settings, "search_r_pct");
 	s->search_pct[2] = (float)obs_data_get_double(settings, "search_t_pct");
-	s->search_pct[3] = (float)obs_data_get_double(settings, "search_b_pct");
+	s->search_pct[3] = (float)choice_value(settings, "seats", ch_seats, "search_b_pct");
 	s->pursuit_s = (float)obs_data_get_double(settings, "pursuit_s");
-	s->lead_frac = (float)obs_data_get_double(settings, "lead_pct") * 0.01f;
+	s->lead_frac = (float)choice_value(settings, "lead", ch_lead, "lead_pct") * 0.01f;
 
 	s->ki.v[0] = (float)obs_data_get_double(settings, "Ki_x");
 	s->ki.v[1] = (float)obs_data_get_double(settings, "Ki_y");
@@ -235,8 +280,8 @@ static void ftptz_update(void *data, obs_data_t *settings)
 	s->tlpf.v[0] = s->tlpf.v[1] = (float)obs_data_get_double(settings, "Tdlpf");
 	s->tlpf.v[2] = (float)obs_data_get_double(settings, "Tdlpf_z");
 	s->zone_mode = obs_data_get_bool(settings, "zone_mode");
-	s->zone_x = (float)obs_data_get_double(settings, "zone_w_pct") * 0.5e-2f;
-	s->zone_y = (float)obs_data_get_double(settings, "zone_h_pct") * 0.5e-2f;
+	s->zone_x = (float)choice_value(settings, "sensitivity", ch_sens_w, "zone_w_pct") * 0.5e-2f;
+	s->zone_y = (float)choice_value(settings, "sensitivity", ch_sens_h, "zone_h_pct") * 0.5e-2f;
 	s->zone_anticipation = (float)obs_data_get_double(settings, "zone_anticipation");
 	s->zone_strength = (float)obs_data_get_double(settings, "zone_strength");
 	if (s->zone_strength < 0.2f)
@@ -430,9 +475,10 @@ static bool show_advanced_modified(obs_properties_t *props, obs_property_t *, ob
 	static const char *advanced[] = {
 		"preset_grp",
 		"facelost",
-		"ftm",   // detector internals
-		"track", // framing in the old units
-		"ctrl",  // control-loop internals
+		"g_numbers", // the numbers behind the named choices
+		"ftm",       // detector internals
+		"track",     // framing in the old units
+		"ctrl",      // control-loop internals
 		"invert_z",
 		"upsize_l",
 		"upsize_r",
@@ -501,8 +547,7 @@ static obs_properties_t *ftptz_properties(void *data)
 		obs_property_t *p;
 		p = obs_properties_add_list(pp, "follow_mode", obs_module_text("Choosing the person"),
 					    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-		obs_property_list_add_string(p, obs_module_text("Automatic: the biggest person in the search area"),
-					     "auto");
+		obs_property_list_add_string(p, obs_module_text("Automatic: the biggest person on stage"), "auto");
 		obs_property_list_add_string(p, obs_module_text("Manual: only the person I lock on"), "manual");
 		obs_property_set_long_description(
 			p,
@@ -510,10 +555,11 @@ static obs_properties_t *ftptz_properties(void *data)
 					"(button above, hotkey, or the head's phone page). The camera stays with that "
 					"person. If they leave the picture it waits for them and never picks somebody "
 					"else by itself."));
-		p = obs_properties_add_float_slider(
-			pp, "lock_hold", obs_module_text("Automatic: wait for a lost person before picking another"),
-			1.0, 60.0, 1.0);
-		obs_property_float_set_suffix(p, " s");
+		p = obs_properties_add_list(pp, "lock_hold", obs_module_text("Automatic: if the person is lost"),
+					    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_FLOAT);
+		obs_property_list_add_float(p, obs_module_text("Wait 5 seconds, then follow somebody else"), 5.0);
+		obs_property_list_add_float(p, obs_module_text("Wait 10 seconds, then follow somebody else"), 10.0);
+		obs_property_list_add_float(p, obs_module_text("Wait 30 seconds, then follow somebody else"), 30.0);
 		obs_properties_add_group(
 			props, "g_who",
 			obs_module_text("1. Who to follow    (blue = people found, green = the one followed)"),
@@ -524,23 +570,18 @@ static obs_properties_t *ftptz_properties(void *data)
 	{
 		obs_properties_t *pp = obs_properties_create();
 		obs_property_t *p;
-		p = obs_properties_add_float_slider(pp, "head_top_pct", obs_module_text("Head: distance from the top"),
-						    5.0, 60.0, 1.0);
-		obs_property_float_set_suffix(p, " % of the height");
-		obs_property_set_long_description(
-			p, obs_module_text("Where the person's head sits. 25 % leaves normal head room for a full-body "
-					   "shot; 15 to 20 % for a closer shot. The yellow cross shows the spot."));
-		p = obs_properties_add_float_slider(pp, "head_left_pct",
-						    obs_module_text("Head: distance from the left"), 20.0, 80.0, 1.0);
-		obs_property_float_set_suffix(p, " % of the width");
-		obs_property_set_long_description(p, obs_module_text("50 % = centred."));
-		p = obs_properties_add_float_slider(pp, "lead_pct", obs_module_text("Lead room while walking"), 0.0,
-						    15.0, 1.0);
-		obs_property_float_set_suffix(p, " % of the width");
-		obs_property_set_long_description(
-			p, obs_module_text(
-				   "While the person walks, they are framed this far behind the middle, leaving "
-				   "space in front of them. It eases back to the middle when they stop. 0 = off."));
+		p = obs_properties_add_list(pp, "headroom", obs_module_text("Head room (space above the head)"),
+					    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+		obs_property_list_add_string(p, obs_module_text("Tight (closer shots)"), "tight");
+		obs_property_list_add_string(p, obs_module_text("Normal"), "normal");
+		obs_property_list_add_string(p, obs_module_text("Generous (wide shots)"), "generous");
+		obs_property_list_add_string(p, obs_module_text("Custom (number under Advanced)"), "custom");
+		p = obs_properties_add_list(pp, "lead", obs_module_text("Space in front of a walking person"),
+					    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+		obs_property_list_add_string(p, obs_module_text("None: always centred"), "off");
+		obs_property_list_add_string(p, obs_module_text("A little"), "some");
+		obs_property_list_add_string(p, obs_module_text("More"), "more");
+		obs_property_list_add_string(p, obs_module_text("Custom (number under Advanced)"), "custom");
 		obs_properties_add_group(props, "g_frame",
 					 obs_module_text("2. Framing    (yellow cross = where the head goes)"),
 					 OBS_GROUP_NORMAL, pp);
@@ -550,56 +591,98 @@ static obs_properties_t *ftptz_properties(void *data)
 	{
 		obs_properties_t *pp = obs_properties_create();
 		obs_property_t *p;
-		p = obs_properties_add_float_slider(pp, "zone_w_pct", obs_module_text("Rest zone: width"), 4.0, 80.0,
-						    1.0);
-		obs_property_float_set_suffix(p, " % of the width");
+		p = obs_properties_add_list(pp, "sensitivity", obs_module_text("Sensitivity"), OBS_COMBO_TYPE_LIST,
+					    OBS_COMBO_FORMAT_STRING);
+		obs_property_list_add_string(p, obs_module_text("Low: calm camera, ignores small movements"), "low");
+		obs_property_list_add_string(p, obs_module_text("Medium"), "medium");
+		obs_property_list_add_string(p, obs_module_text("High: follows small movements too"), "high");
+		obs_property_list_add_string(p, obs_module_text("Custom (numbers under Advanced)"), "custom");
 		obs_property_set_long_description(
 			p,
-			obs_module_text("The camera holds still while the head is inside the big yellow box. Wider = "
-					"calmer camera, person can be further off-centre. Typical: 15 to 30 %."));
-		p = obs_properties_add_float_slider(pp, "zone_h_pct", obs_module_text("Rest zone: height"), 4.0, 80.0,
-						    1.0);
-		obs_property_float_set_suffix(p, " % of the height");
+			obs_module_text("How far the person may move from the yellow cross before the camera follows. "
+					"The big yellow box on the preview shows it."));
+		p = obs_properties_add_list(pp, "zone_strength", obs_module_text("Speed"), OBS_COMBO_TYPE_LIST,
+					    OBS_COMBO_FORMAT_FLOAT);
+		obs_property_list_add_float(p, obs_module_text("Gentle: slow, smooth catching up"), 0.6);
+		obs_property_list_add_float(p, obs_module_text("Normal"), 1.0);
+		obs_property_list_add_float(p, obs_module_text("Firm: for people who move fast"), 1.6);
+		obs_property_set_long_description(
+			p, obs_module_text("How quickly the camera brings the person back. If a fast mover gets away, "
+					   "choose Firm and a higher Sensitivity."));
 		p = obs_properties_add_list(pp, "zone_anticipation", obs_module_text("When the person walks"),
 					    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_FLOAT);
-		obs_property_list_add_float(p, obs_module_text("Travel with them at their speed"), 1.0);
+		obs_property_list_add_float(p, obs_module_text("Travel with them (like a camera operator)"), 1.0);
 		obs_property_list_add_float(p, obs_module_text("Travel with them, a little behind"), 0.6);
-		obs_property_list_add_float(p, obs_module_text("Wait until they leave the rest zone"), 0.0);
-		p = obs_properties_add_list(pp, "zone_strength",
-					    obs_module_text("Bringing the person back to the middle"),
+		obs_property_list_add_float(p, obs_module_text("Only move once they are off-centre"), 0.0);
+		p = obs_properties_add_list(pp, "scope", obs_module_text("The camera may"), OBS_COMBO_TYPE_LIST,
+					    OBS_COMBO_FORMAT_STRING);
+		obs_property_list_add_string(p, obs_module_text("Turn and tilt"), "pt");
+		obs_property_list_add_string(p, obs_module_text("Turn only (tilt stays where the joystick left it)"),
+					     "pan");
+		p = obs_properties_add_list(pp, "pursuit_s", obs_module_text("If the person walks out of the picture"),
 					    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_FLOAT);
-		obs_property_list_add_float(p, obs_module_text("Gentle"), 0.6);
-		obs_property_list_add_float(p, obs_module_text("Normal"), 1.0);
-		obs_property_list_add_float(p, obs_module_text("Firm (fast walkers)"), 1.6);
-		obs_property_set_long_description(
-			p,
-			obs_module_text("There are no speed numbers to tune: the plugin measures how the head really "
-					"answers and adjusts its commands by itself."));
-		p = obs_properties_add_float_slider(
-			pp, "pursuit_s", obs_module_text("Keep turning after the person walks out of the picture"), 0.0,
-			5.0, 0.5);
-		obs_property_float_set_suffix(p, " s");
-		obs_properties_add_group(
-			props, "g_move",
-			obs_module_text("3. Movement    (big yellow box = rest zone, small = settle zone)"),
-			OBS_GROUP_NORMAL, pp);
+		obs_property_list_add_float(p, obs_module_text("Stop and wait"), 0.0);
+		obs_property_list_add_float(p, obs_module_text("Keep turning that way for 2 seconds"), 2.0);
+		obs_property_list_add_float(p, obs_module_text("Keep turning that way for 4 seconds"), 4.0);
+		obs_properties_add_group(props, "g_move",
+					 obs_module_text("3. Movement    (big yellow box = where the camera rests)"),
+					 OBS_GROUP_NORMAL, pp);
 	}
 
 	// ---- 4. Search area
 	{
 		obs_properties_t *pp = obs_properties_create();
 		obs_property_t *p;
-		static const char *keys[4] = {"search_b_pct", "search_t_pct", "search_l_pct", "search_r_pct"};
-		static const char *names[4] = {"Ignore the bottom of the picture (congregation)", "Ignore the top",
-					       "Ignore the left side", "Ignore the right side"};
-		for (int i = 0; i < 4; i++) {
-			p = obs_properties_add_float_slider(pp, keys[i], obs_module_text(names[i]), 0.0, 80.0, 1.0);
-			obs_property_float_set_suffix(p, i < 2 ? " % of the height" : " % of the width");
-		}
+		p = obs_properties_add_list(pp, "seats", obs_module_text("Seats in the bottom of the picture"),
+					    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+		obs_property_list_add_string(p, obs_module_text("None in view"), "none");
+		obs_property_list_add_string(p, obs_module_text("A few heads (ignore the bottom 15 %)"), "low");
+		obs_property_list_add_string(p, obs_module_text("Front rows (ignore the bottom 28 %)"), "medium");
+		obs_property_list_add_string(p, obs_module_text("Many rows (ignore the bottom 40 %)"), "high");
+		obs_property_list_add_string(p, obs_module_text("Custom (numbers under Advanced)"), "custom");
+		obs_property_set_long_description(
+			p, obs_module_text("People below the orange line are never followed. Set it so the orange box "
+					   "covers the stage and leaves out the congregation."));
 		obs_properties_add_group(
 			props, "g_search",
 			obs_module_text("4. Search area    (orange box = where people are looked for)"),
 			OBS_GROUP_NORMAL, pp);
+	}
+
+	// ---- Advanced: the numbers behind the choices above
+	{
+		obs_properties_t *pp = obs_properties_create();
+		obs_property_t *p;
+		p = obs_properties_add_float_slider(pp, "head_top_pct",
+						    obs_module_text("Head room = Custom: head this far from the top"),
+						    5.0, 60.0, 1.0);
+		obs_property_float_set_suffix(p, " % of the height");
+		p = obs_properties_add_float_slider(pp, "head_left_pct", obs_module_text("Head this far from the left"),
+						    20.0, 80.0, 1.0);
+		obs_property_float_set_suffix(p, " % of the width");
+		p = obs_properties_add_float_slider(pp, "lead_pct", obs_module_text("Space in front = Custom"), 0.0,
+						    15.0, 1.0);
+		obs_property_float_set_suffix(p, " % of the width");
+		p = obs_properties_add_float_slider(
+			pp, "zone_w_pct", obs_module_text("Sensitivity = Custom: rest zone width"), 4.0, 80.0, 1.0);
+		obs_property_float_set_suffix(p, " % of the width");
+		p = obs_properties_add_float_slider(
+			pp, "zone_h_pct", obs_module_text("Sensitivity = Custom: rest zone height"), 4.0, 80.0, 1.0);
+		obs_property_float_set_suffix(p, " % of the height");
+		p = obs_properties_add_float_slider(
+			pp, "search_b_pct", obs_module_text("Seats = Custom: ignore the bottom"), 0.0, 80.0, 1.0);
+		obs_property_float_set_suffix(p, " % of the height");
+		p = obs_properties_add_float_slider(pp, "search_t_pct", obs_module_text("Ignore the top"), 0.0, 80.0,
+						    1.0);
+		obs_property_float_set_suffix(p, " % of the height");
+		p = obs_properties_add_float_slider(pp, "search_l_pct", obs_module_text("Ignore the left side"), 0.0,
+						    80.0, 1.0);
+		obs_property_float_set_suffix(p, " % of the width");
+		p = obs_properties_add_float_slider(pp, "search_r_pct", obs_module_text("Ignore the right side"), 0.0,
+						    80.0, 1.0);
+		obs_property_float_set_suffix(p, " % of the width");
+		obs_properties_add_group(props, "g_numbers", obs_module_text("Advanced: exact numbers"),
+					 OBS_GROUP_NORMAL, pp);
 	}
 
 	{
@@ -809,6 +892,11 @@ static void ftptz_get_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, "search_b_pct", 28.0);
 	obs_data_set_default_double(settings, "pursuit_s", 2.0);
 	obs_data_set_default_double(settings, "lead_pct", 5.0);
+	obs_data_set_default_string(settings, "headroom", "normal");
+	obs_data_set_default_string(settings, "lead", "some");
+	obs_data_set_default_string(settings, "sensitivity", "medium");
+	obs_data_set_default_string(settings, "seats", "medium");
+	obs_data_set_default_string(settings, "scope", "pt");
 	obs_data_set_default_double(settings, "zone_x", 10.0);
 	obs_data_set_default_double(settings, "zone_y", 10.0);
 	obs_data_set_default_double(settings, "zone_anticipation", 1.0);
@@ -1133,6 +1221,8 @@ static void tick_filter(struct face_tracker_ptz *s, float second)
 				const float cmd_max = 0.6f * size;
 				cmd = std::max(-cmd_max, std::min(cmd_max, cmd));
 			}
+			if (i == 1 && s->pan_only)
+				cmd = 0.0f; // tilt stays where the operator left it
 			s->zone_cmd[i] = cmd;
 			s->filter_int.v[i] = 0.0f;
 			e_int.v[i] = 0.0f;

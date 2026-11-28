@@ -85,4 +85,20 @@ struct face_tracker_ptz
 	bool pan_only;   // tilt is left where the operator put it
 	float lead_frac; // lead room when walking, as a fraction of the picture width
 	float zone_lead; // lead room in use right now, px (eases in and out)
+
+	// What happened in the last minute, written to the OBS log as one "X70-STATS" line for tuning afterwards.
+	struct stats_s
+	{
+		float t = 0;                      // seconds covered
+		float t_seen = 0;                 // presenter in view
+		float t_moving = 0;               // camera turning
+		float t_pose = 0;                 // head taken from the body pose
+		float off_sum = 0, off_max = 0;   // how far from the framing point, share of the picture width
+		float v_max = 0;                  // fastest the presenter moved, share of the width per second
+		float cmd_max = 0;                // strongest turn asked of the head
+		int lost = 0, chased = 0;         // times lost; times followed out of the picture
+		int lost_edge = 0, lost_fast = 0; // lost near the side of the picture; lost while walking
+		float gone = 0, gone_max = 0;     // how long the current / the longest absence lasted
+		int people_max = 0;
+	} stats;
 };

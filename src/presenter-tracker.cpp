@@ -108,6 +108,12 @@ void presenter_tracker::start_track(const pt_det &d, double t)
 	tr.n_sig = 0;
 	tr.next_sig = 1;
 	memset(tr.sig, 0, sizeof(tr.sig));
+	memset(tr.kp, 0, sizeof(tr.kp));
+	tr.t_kp = 0.0;
+	tr.head_x = tr.head_y = 0.0f;
+	tr.has_head = false;
+	tr.face_dir = 0.0f;
+	tr.hands_up = false;
 	if (d.has_sig) {
 		memcpy(tr.sig[0], d.sig, sizeof(tr.sig[0]));
 		tr.n_sig = 1;
@@ -209,6 +215,60 @@ void presenter_tracker::update(const std::vector<pt_det> &dets, double t)
 		tr.t_seen = t;
 		if (!tr.confirmed && ++tr.hits >= confirm_hits)
 			tr.confirmed = true;
+
+		// Body pose (when the pose model was run on this person): remember it relative to the box. The head is
+		// the middle of the nose, eyes and ears that were found with confidence.
+		if (d.has_kp) {
+			const float bw = d.x1 - d.x0, bh = d.y1 - d.y0, bcx = (d.x0 + d.x1) * 0.5f;
+			for (int k = 0; k < PT_KP; k++) {
+				tr.kp[k][0] = (d.kp[k][0] - bcx) / bw;
+				tr.kp[k][1] = (d.kp[k][1] - d.y0) / bh;
+				tr.kp[k][2] = d.kp[k][2];
+			}
+			tr.t_kp = t;
+			float sx = 0.0f, sy = 0.0f;
+			int n = 0;
+			for (int k = 0; k < 5; k++) {
+				if (tr.kp[k][2] >= 0.35f && tr.kp[k][1] > -0.1f && tr.kp[k][1] < 0.5f &&
+				    fabsf(tr.kp[k][0]) < 0.6f) {
+					sx += tr.kp[k][0];
+					sy += tr.kp[k][1];
+					n++;
+				}
+			}
+			if (n >= 3) {
+				const float hx = sx / (float)n, hy = sy / (float)n;
+				if (!tr.has_head) {
+					tr.head_x = hx;
+					tr.head_y = hy;
+					tr.has_head = true;
+				} else {
+					tr.head_x += 0.4f * (hx - tr.head_x);
+					tr.head_y += 0.4f * (hy - tr.head_y);
+				}
+				// A hand above the head makes the box taller than the person.
+				tr.hands_up = false;
+				for (int k = 9; k <= 10; k++)
+					if (tr.kp[k][2] >= 0.35f && tr.kp[k][1] < hy)
+						tr.hands_up = true;
+				// Facing, from the face itself: seen from the front the nose is midway between the
+				// ears; turned to a side it moves towards, and then past, the ear on that side.
+				const bool el = tr.kp[3][2] >= 0.35f, er = tr.kp[4][2] >= 0.35f;
+				if (tr.kp[0][2] >= 0.35f && (el || er)) {
+					float f;
+					if (el && er) {
+						const float mid = (tr.kp[3][0] + tr.kp[4][0]) * 0.5f;
+						const float half =
+							std::max(0.01f, fabsf(tr.kp[3][0] - tr.kp[4][0]) * 0.5f);
+						f = (tr.kp[0][0] - mid) / half;
+					} else {
+						f = tr.kp[0][0] > tr.kp[el ? 3 : 4][0] ? 1.0f : -1.0f;
+					}
+					f = std::max(-1.0f, std::min(1.0f, f));
+					tr.face_dir += 0.25f * (f - tr.face_dir);
+				}
+			}
+		}
 
 		// Clothing: follow slow changes of the best-matching view, and remember a new view when the person has
 		// turned. Only while nobody else is close, so that somebody passing in front is never learned.
@@ -418,6 +478,45 @@ bool presenter_tracker::predict(double t, float &x0, float &y0, float &x1, float
 	y0 = ty;
 	y1 = ty + pr->h;
 	return true;
+}
+
+bool presenter_tracker::head_point(double t, float &x, float &y) const
+{
+	const track_s *pr = presenter();
+	float x0, y0, x1, y1;
+	if (!pr || !pr->has_head || t - pr->t_kp > 1.5 || !predict(t, x0, y0, x1, y1))
+		return false;
+	x = (x0 + x1) * 0.5f + pr->head_x * (x1 - x0);
+	y = y0 + pr->head_y * (y1 - y0);
+	return true;
+}
+
+bool presenter_tracker::pose(double t, float kp[PT_KP][3]) const
+{
+	const track_s *pr = presenter();
+	float x0, y0, x1, y1;
+	if (!pr || pr->t_kp == 0.0 || t - pr->t_kp > 1.0 || !predict(t, x0, y0, x1, y1))
+		return false;
+	for (int k = 0; k < PT_KP; k++) {
+		kp[k][0] = (x0 + x1) * 0.5f + pr->kp[k][0] * (x1 - x0);
+		kp[k][1] = y0 + pr->kp[k][1] * (y1 - y0);
+		kp[k][2] = pr->kp[k][2];
+	}
+	return true;
+}
+
+float presenter_tracker::facing(double t) const
+{
+	const track_s *pr = presenter();
+	if (!pr || !pr->has_head || t - pr->t_kp > 1.5)
+		return 0.0f;
+	return pr->face_dir;
+}
+
+bool presenter_tracker::arms_up(double t) const
+{
+	const track_s *pr = presenter();
+	return pr && pr->has_head && t - pr->t_kp < 1.5 && pr->hands_up;
 }
 
 void presenter_tracker::velocity(float &vx, float &vy) const

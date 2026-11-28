@@ -48,6 +48,79 @@ static inline void pd_clothing_signature(const dlib::matrix<dlib::rgb_pixel> &im
 	d.has_sig = true;
 }
 
+// ---- Body pose of one person (MoveNet, run on a crop around that person) ---------------------------------------
+#define PD_POSE_SIZE 192
+
+// box: the person, in pixels of img. Fills kp with x, y (pixels of img) and confidence for the 17 body points.
+static inline bool pd_pose(ncnn::Net &net, const dlib::matrix<dlib::rgb_pixel> &img, float bx0, float by0, float bx1,
+			   float by1, float kp[PT_KP][3])
+{
+	// a crop with room around the person: the model works best when the person does not touch the edges
+	const float bw = bx1 - bx0, bh = by1 - by0;
+	const int cx0 = std::max(0, (int)(bx0 - 0.6f * bw)), cx1 = std::min((int)img.nc(), (int)(bx1 + 0.6f * bw));
+	const int cy0 = std::max(0, (int)(by0 - 0.1f * bh)), cy1 = std::min((int)img.nr(), (int)(by1 + 0.1f * bh));
+	const int cw = cx1 - cx0, ch = cy1 - cy0;
+	if (cw < 16 || ch < 32)
+		return false;
+	const float r = std::min((float)PD_POSE_SIZE / (float)cw, (float)PD_POSE_SIZE / (float)ch);
+	const int nw = std::max(1, (int)(cw * r)), nh = std::max(1, (int)(ch * r));
+	const int px = (PD_POSE_SIZE - nw) / 2, py = (PD_POSE_SIZE - nh) / 2;
+	ncnn::Mat resized = ncnn::Mat::from_pixels_resize((const unsigned char *)&img(cy0, cx0), ncnn::Mat::PIXEL_RGB,
+							  cw, ch, (int)img.nc() * 3, nw, nh);
+	ncnn::Mat in;
+	ncnn::copy_make_border(resized, in, py, PD_POSE_SIZE - nh - py, px, PD_POSE_SIZE - nw - px,
+			       ncnn::BORDER_CONSTANT, 0.0f);
+	static const float mean[3] = {127.5f, 127.5f, 127.5f}, norm[3] = {1.0f / 127.5f, 1.0f / 127.5f, 1.0f / 127.5f};
+	in.substract_mean_normalize(mean, norm);
+
+	ncnn::Mat heat, center, regress, offset;
+	{
+		ncnn::Extractor ex = net.create_extractor();
+		ex.input("input", in);
+		if (ex.extract("heatmap", heat) || ex.extract("center", center) || ex.extract("regress", regress) ||
+		    ex.extract("offset", offset))
+			return false;
+	}
+	const int f = PD_POSE_SIZE / 4; // the model answers on a 48 x 48 grid
+	if (heat.c != f || heat.h != f || heat.w != PT_KP || regress.w != 2 * PT_KP || offset.w != 2 * PT_KP ||
+	    (int)center.total() < f * f)
+		return false;
+
+	// 1. where the middle of the person is
+	const float *ce = center;
+	int best = 0;
+	for (int i = 1; i < f * f; i++)
+		if (ce[i] > ce[best])
+			best = i;
+	const int cy = best / f, cx = best % f;
+	// 2. from there the model points roughly at each body point; 3. the exact spot is the strongest response near it
+	const float *rg = regress.channel(cy).row(cx);
+	for (int k = 0; k < PT_KP; k++) {
+		const float ry = rg[k] + (float)cy, rx = rg[k + PT_KP] + (float)cx;
+		float best_w = -1.0f;
+		int ky = 0, kx = 0;
+		for (int y = 0; y < f; y++) {
+			const ncnn::Mat hrow = heat.channel(y);
+			for (int x = 0; x < f; x++) {
+				const float dy = (float)y - ry, dx = (float)x - rx;
+				const float w = hrow.row(x)[k] / (sqrtf(dy * dy + dx * dx) + 1.8f);
+				if (w > best_w) {
+					best_w = w;
+					ky = y;
+					kx = x;
+				}
+			}
+		}
+		const float *of = offset.channel(ky).row(kx);
+		const float yy = ((float)ky + of[k]) / (float)f * PD_POSE_SIZE;
+		const float xx = ((float)kx + of[k + PT_KP]) / (float)f * PD_POSE_SIZE;
+		kp[k][0] = (xx - (float)px) / r + (float)cx0;
+		kp[k][1] = (yy - (float)py) / r + (float)cy0;
+		kp[k][2] = heat.channel(ky).row(kx)[k];
+	}
+	return true;
+}
+
 // ---- How much the camera itself moved between two analysed pictures -------------------------------------------
 // When the camera pans or tilts, the whole background slides across the picture. Measuring that slide tells us how
 // fast the camera is really turning, with no feedback from the head and no calibration. The picture is cut into
@@ -219,6 +292,7 @@ static inline bool person_detect_core(ncnn::Net &net, const dlib::matrix<dlib::r
 				d.y1 = (by + bh * 0.5f) / r;
 				d.score = score;
 				d.has_sig = false;
+				d.has_kp = false;
 				cand.push_back(d);
 			}
 		}

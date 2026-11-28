@@ -18,6 +18,7 @@
 
 #define PT_SIG 64    // 4x4x4 colour histogram
 #define PT_GALLERY 4 // views of a person's clothing that are remembered
+#define PT_KP 17 // body points from the pose model: nose, eyes, ears, shoulders, elbows, wrists, hips, knees, ankles
 
 struct pt_det
 {
@@ -25,6 +26,8 @@ struct pt_det
 	float score;
 	float sig[PT_SIG];
 	bool has_sig;
+	float kp[PT_KP][3]; // x, y, confidence of each body point (only for the person the pose model was run on)
+	bool has_kp;
 };
 
 class presenter_tracker {
@@ -58,6 +61,17 @@ public:
 	// How fast the presenter is moving across the picture, pixels per second (0 when nobody is being followed).
 	void velocity(float &vx, float &vy) const;
 
+	// Where the presenter's head is at time t, from the body pose. False when the pose is not known (use the top of
+	// the box instead).
+	bool head_point(double t, float &x, float &y) const;
+	// The presenter's body points at time t (x, y, confidence), for drawing. False when not known.
+	bool pose(double t, float kp[PT_KP][3]) const;
+	// Which way the presenter faces: -1 = fully to the left of the picture, 0 = towards or away from the camera,
+	// +1 = fully to the right. 0 when not known.
+	float facing(double t) const;
+	// True while a hand is held above the head (the box around the body is then taller than the person).
+	bool arms_up(double t) const;
+
 	state_e state() const;
 	int people() const; // confirmed people in view
 	// One line for the log each time something worth knowing happened; empty otherwise.
@@ -81,6 +95,14 @@ private:
 		float sig[PT_GALLERY][PT_SIG];
 		int n_sig;
 		int next_sig;
+		// body pose, stored relative to the box so that it moves with the prediction
+		float kp[PT_KP]
+			[3]; // x as a share of the box width from its centre, y as a share of the height from its top
+		double t_kp; // when the pose was last seen (0 = never)
+		float head_x, head_y;
+		bool has_head;
+		float face_dir;
+		bool hands_up;
 	};
 	static void ax_init(axis_s &a, float p, float r);
 	static void ax_predict(axis_s &a, float dt, float q);

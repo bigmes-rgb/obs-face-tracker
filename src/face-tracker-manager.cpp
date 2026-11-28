@@ -22,6 +22,7 @@
 #define DIR_DLIB_CNN "dlib_cnn_model"
 #define DIR_DLIB_LANDMARK "dlib_face_landmark_model"
 #define DIR_PERSON "person_model"
+#define DIR_POSE "pose_model"
 
 bool face_tracker_manager::person_engine_available()
 {
@@ -333,7 +334,8 @@ inline void face_tracker_manager::stage_to_detector()
 				camera_vy = camera_speed_known ? -by : 0.0f;
 				std::string ev = presenter.take_event();
 				if (!ev.empty())
-					blog(LOG_INFO, "%s; detection takes about %d ms", ev.c_str(), d->last_ms());
+					blog(LOG_INFO, "%s; detection takes about %d ms (of which body pose %d ms)",
+					     ev.c_str(), d->last_ms(), d->last_pose_ms());
 			}
 #endif
 		} else {
@@ -370,8 +372,18 @@ inline void face_tracker_manager::stage_to_detector()
 				bfree(fb);
 			}
 			presenter_det_time = (double)os_gettime_ns() * 1e-9;
-			if (auto *d = dynamic_cast<face_detector_person *>(detect))
+			if (auto *d = dynamic_cast<face_detector_person *>(detect)) {
 				d->set_time(presenter_det_time);
+				// body pose of the presenter, where they are expected in this picture
+				float hx0 = 0, hy0 = 0, hx1 = 0, hy1 = 0;
+				const bool have = presenter.predict(presenter_det_time, hx0, hy0, hx1, hy1);
+				char *fp = obs_module_file(DIR_POSE "/movenet_lightning.param");
+				char *fb = obs_module_file(DIR_POSE "/movenet_lightning.bin");
+				d->set_pose(fp ? fp : "", fb ? fb : "", pose_on && have && fp && fb, hx0, hy0, hx1,
+					    hy1);
+				bfree(fp);
+				bfree(fb);
+			}
 		}
 #endif
 		detect->signal();
@@ -524,21 +536,40 @@ void face_tracker_manager::tick(float second)
 	if (detector_engine == engine_person) {
 		// One target: the presenter, where the motion model says they are right now. The camera frames the
 		// head, taken as the top of the body box.
+		// With the body pose known, the head is where the pose says it is: this stays right when an arm is
+		// raised or the person leans, when the top and the middle of the box are no longer the head.
 		float x0, y0, x1, y1;
-		if (presenter.predict((double)os_gettime_ns() * 1e-9, x0, y0, x1, y1)) {
+		const double t_now = (double)os_gettime_ns() * 1e-9;
+		if (presenter.predict(t_now, x0, y0, x1, y1)) {
 			const float bw = x1 - x0, bh = y1 - y0;
 			float head = std::min(bh / 7.0f, bw * 0.45f);
 			if (head < 8.0f)
 				head = 8.0f;
-			const float cx = (x0 + x1) * 0.5f;
+			// the head's size changes slowly, and not at all while a raised hand stretches the box
+			if (presenter_head <= 0.0f)
+				presenter_head = head;
+			else if (!presenter.arms_up(t_now))
+				presenter_head += (head - presenter_head) * std::min(1.0f, second / 1.0f);
+			head = presenter_head;
+			float cx = (x0 + x1) * 0.5f, top = y0;
+			float hx, hy;
+			pose_known = pose_on && presenter.head_point(t_now, hx, hy);
+			if (pose_known) {
+				cx = hx;
+				top = hy - head * 0.55f; // the point is the middle of the face
+			}
+			presenter_facing = pose_known ? presenter.facing(t_now) : 0.0f;
 			tracker_rects.resize(1);
 			auto &r = tracker_rects[0];
-			r.rect = rect_s{(int)(cx - head * 0.5f), (int)y0, (int)(cx + head * 0.5f), (int)(y0 + head),
+			r.rect = rect_s{(int)(cx - head * 0.5f), (int)top, (int)(cx + head * 0.5f), (int)(top + head),
 					1.0f};
 			r.crop_rect = crop_cur;
 			r.landmark.clear();
 		} else {
 			tracker_rects.clear();
+			presenter_head = 0.0f;
+			pose_known = false;
+			presenter_facing = 0.0f;
 		}
 		presenter.velocity(presenter_vx, presenter_vy);
 		return;
@@ -605,6 +636,7 @@ void face_tracker_manager::update(obs_data_t *settings)
 		update_detector(this, _detector_engine);
 	person_model = obs_data_get_string(settings, "person_model");
 	follow_manual = strcmp(obs_data_get_string(settings, "follow_mode"), "manual") == 0;
+	pose_on = obs_data_get_bool(settings, "pose");
 	person_interval = (float)obs_data_get_double(settings, "person_interval");
 	if (person_interval < 0.05f)
 		person_interval = 0.05f;
@@ -727,6 +759,7 @@ void face_tracker_manager::get_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, "lock_hold", 6.0);
 	obs_data_set_default_string(settings, "person_model", "tiny");
 	obs_data_set_default_double(settings, "person_interval", 0.1);
+	obs_data_set_default_bool(settings, "pose", true);
 	obs_data_set_default_string(settings, "follow_mode", "auto");
 	obs_data_set_default_bool(settings, "tracking_th_en", true);
 	obs_data_set_default_double(settings, "tracking_th_dB", -80.0);

@@ -825,6 +825,14 @@ static obs_properties_t *ftptz_properties(void *data)
 							     OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 		obs_property_list_add_string(pm, obs_module_text("Accurate (default)"), "tiny");
 		obs_property_list_add_string(pm, obs_module_text("Fast (use if OBS reports overload)"), "nano");
+		obs_property_t *po = obs_properties_add_bool(
+			pp, "pose", obs_module_text("Find the head from the body pose (yellow stick figure)"));
+		obs_property_set_long_description(
+			po,
+			obs_module_text("Finds the head, shoulders, arms and legs of the person being followed. The "
+					"camera then frames the real head, so a raised arm or a lean does not move "
+					"the shot, and leaves a little room on the side the person is facing. Costs "
+					"about 10 ms per look. Turn off only if OBS reports overload."));
 		obs_properties_add_bool(pp, "debug_faces", "Show the coloured boxes in this window");
 		obs_properties_add_bool(pp, "debug_always_show",
 					"Show them on the main OBS preview too (they are never recorded or streamed)");
@@ -1125,6 +1133,59 @@ static void tick_filter(struct face_tracker_ptz *s, float second)
 
 	f3 e = s->detect_err;
 	f3 e_int = e;
+
+	// One line a minute in the OBS log, for tuning after a service (see tools/x70_report.py).
+	if (s->zone_mode && s->known_width > 0) {
+		auto &st = s->stats;
+		const float w = (float)s->known_width;
+		st.t += second;
+		if (s->face_found) {
+			st.t_seen += second;
+			const float off = std::abs(e.v[0]) / w;
+			st.off_sum += off * second;
+			st.off_max = std::max(st.off_max, off);
+			st.v_max = std::max(st.v_max, std::abs(s->zone_v[0]) / w);
+			st.gone = 0.0f;
+			if (s->ftm->pose_known)
+				st.t_pose += second;
+		} else {
+			if (s->face_found_last) {
+				st.lost++;
+				if (std::abs(s->zone_last_x[0]) > 0.3f * w)
+					st.lost_edge++;
+				if (std::abs(s->zone_v[0]) > 0.06f * w)
+					st.lost_fast++;
+			}
+			st.gone += second;
+			st.gone_max = std::max(st.gone_max, st.gone);
+		}
+		if (s->zone_moving[0] || s->zone_moving[1])
+			st.t_moving += second;
+		st.cmd_max = std::max(st.cmd_max, std::abs(s->zone_cmd[0]) / w);
+		if (s->zone_pursuit_left > 0.0f && s->zone_pursuit_left >= s->pursuit_s - second * 1.5f)
+			st.chased++;
+#ifdef WITH_NCNN
+		st.people_max = std::max(st.people_max, s->ftm->presenter.people());
+#endif
+		if (st.t >= 60.0f) {
+			if (st.t_seen > 0.0f || st.lost > 0)
+				blog(LOG_INFO,
+				     "X70-STATS secs=%.0f seen=%.0f%% lost=%d lost_edge=%d lost_fast=%d gone_max=%.1f "
+				     "chased=%d off_avg=%.1f%% off_max=%.0f%% v_max=%.0f%%/s moving=%.0f%% cmd_max=%.0f%% "
+				     "people_max=%d pose=%.0f%% gain_pan=%.2f gain_tilt=%.2f cam_measured=%d zone=%.0f%% "
+				     "strength=%.1f antic=%.1f pursuit=%.0f lead=%.0f%%",
+				     st.t, 100.0f * st.t_seen / st.t, st.lost, st.lost_edge, st.lost_fast, st.gone_max,
+				     st.chased, st.t_seen > 0 ? 100.0f * st.off_sum / st.t_seen : 0.0f,
+				     100.0f * st.off_max, 100.0f * st.v_max, 100.0f * st.t_moving / st.t,
+				     100.0f * st.cmd_max, st.people_max,
+				     st.t_seen > 0 ? 100.0f * st.t_pose / st.t_seen : 0.0f, s->zone_gain[0],
+				     s->zone_gain[1], (int)s->ftm->camera_speed_known, 200.0f * s->zone_x,
+				     s->zone_strength, s->zone_anticipation, s->pursuit_s, 100.0f * s->lead_frac);
+			const float gone = st.gone;
+			st = face_tracker_ptz::stats_s();
+			st.gone = gone;
+		}
+	}
 	for (int i = 0; i < 3; i++) {
 		float x = e.v[i];
 		if (s->zone_mode && i < 2) {
@@ -1166,9 +1227,16 @@ static void tick_filter(struct face_tracker_ptz *s, float second)
 			// of them, the way an operator frames a walk. It eases in as they walk and out when they stop.
 			if (i == 0) {
 				float want = 0.0f;
-				if (s->face_found)
+				if (s->face_found) {
 					want = s->lead_frac * size *
 					       std::max(-1.0f, std::min(1.0f, s->zone_v[0] / (0.15f * size)));
+					// Looking room: standing but turned to one side, a little space is left on the
+					// side the person faces (known from the body pose).
+					const float f = s->ftm->presenter_facing;
+					if (std::abs(s->zone_v[0]) < v_still && std::abs(f) > 0.4f)
+						want = 0.6f * s->lead_frac * size * (f > 0 ? 1.0f : -1.0f) *
+						       (std::abs(f) - 0.4f) / 0.6f;
+				}
 				s->zone_lead += (want - s->zone_lead) * std::min(1.0f, second / 0.8f);
 				x += s->zone_lead;
 			}
@@ -1660,6 +1728,26 @@ static void draw_frame_info(struct face_tracker_ptz *s, bool landmark_only = fal
 				draw_landmark(tr.landmark);
 		}
 
+#ifdef WITH_NCNN
+		// Body pose of the person being followed: a yellow stick figure.
+		float kp[PT_KP][3];
+		if (draw_trk && s->ftm->detector_engine == face_tracker_manager::engine_person && s->ftm->pose_on &&
+		    s->ftm->presenter.pose((double)os_gettime_ns() * 1e-9, kp)) {
+			static const int bone[][2] = {{5, 6},  {5, 7},   {7, 9},   {6, 8},   {8, 10},  {5, 11},
+						      {6, 12}, {11, 12}, {11, 13}, {13, 15}, {12, 14}, {14, 16},
+						      {0, 1},  {0, 2},   {1, 3},   {2, 4}};
+			gs_effect_set_color(gs_effect_get_param_by_name(effect, "color"), 0xFF00FFFF);
+			for (size_t b = 0; b < sizeof(bone) / sizeof(bone[0]); b++) {
+				const float *a = kp[bone[b][0]], *c = kp[bone[b][1]];
+				if (a[2] < 0.35f || c[2] < 0.35f)
+					continue;
+				gs_render_start(false);
+				gs_vertex2f(a[0], a[1]);
+				gs_vertex2f(c[0], c[1]);
+				gs_render_stop(GS_LINES);
+			}
+		}
+#endif
 		if (draw_ref) {
 			gs_effect_set_color(gs_effect_get_param_by_name(effect, "color"), 0xFFFFFF00); // amber
 			gs_render_start(false);

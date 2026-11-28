@@ -62,6 +62,10 @@ public: // properties
 	presenter_tracker presenter;
 	double presenter_det_time = 0.0;                // when the picture now in the detector was taken
 	float presenter_vx = 0.0f, presenter_vy = 0.0f; // presenter's speed across the picture, px/s
+	bool pose_on = true;                            // find the presenter's head, shoulders and limbs
+	bool pose_known = false;                        // the framing point comes from the body pose right now
+	float presenter_head = 0.0f;                    // size of the presenter's head, px
+	float presenter_facing = 0.0f;                  // -1 = facing left, 0 = towards the camera, +1 = facing right
 	bool camera_speed_known = false;                // the camera's own movement was measured from the background
 	float camera_vx = 0.0f, camera_vy = 0.0f; // how fast the camera sweeps the picture, px/s (+ = right / down)
 	static bool person_engine_available();

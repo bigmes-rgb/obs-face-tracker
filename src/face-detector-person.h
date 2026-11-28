@@ -17,6 +17,9 @@ public:
 	void get_faces(std::vector<struct rect_s> &) override; // the person boxes, for drawing
 	void get_persons(std::vector<pt_det> &);
 	void set_model(const char *param_file, const char *bin_file);
+	// The body-pose model, and the box (full-size picture) of the person whose pose is wanted. on = false: no pose.
+	void set_pose(const char *param_file, const char *bin_file, bool on, float x0, float y0, float x1, float y1);
+	int last_pose_ms();
 	void set_time(double t); // when the picture handed over with set_texture was taken, in seconds
 	// How fast the background slid across the picture between the last two analysed pictures (px/s). This is the
 	// camera's own movement. False when it could not be measured.

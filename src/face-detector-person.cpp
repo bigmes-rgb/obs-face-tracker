@@ -28,6 +28,11 @@ struct face_detector_person_private_s
 	ncnn::Net net;
 	bool net_loaded = false;
 	bool has_error = false;
+	ncnn::Net pose_net;
+	bool pose_loaded = false, pose_error = false, pose_on = false;
+	std::string pose_param, pose_bin;
+	float hint[4] = {0, 0, 0, 0};
+	int last_pose_ms = 0;
 	std::string param_file, bin_file;
 	int crop_l = 0, crop_r = 0, crop_t = 0, crop_b = 0;
 	int n_error = 0;
@@ -65,6 +70,26 @@ void face_detector_person::set_model(const char *param_file, const char *bin_fil
 		p->bin_file = bin_file;
 		p->net_loaded = false;
 	}
+}
+
+void face_detector_person::set_pose(const char *param_file, const char *bin_file, bool on, float x0, float y0, float x1,
+				    float y1)
+{
+	if (p->pose_param != param_file || p->pose_bin != bin_file) {
+		p->pose_param = param_file;
+		p->pose_bin = bin_file;
+		p->pose_loaded = false;
+	}
+	p->pose_on = on;
+	p->hint[0] = x0;
+	p->hint[1] = y0;
+	p->hint[2] = x1;
+	p->hint[3] = y1;
+}
+
+int face_detector_person::last_pose_ms()
+{
+	return p->last_pose_ms;
 }
 
 void face_detector_person::set_time(double t)
@@ -149,6 +174,52 @@ void face_detector_person::detect_main()
 		p->persons.clear();
 		p->tex.reset();
 		return;
+	}
+
+	// Body pose of the person being followed: the detection that best matches where that person is expected.
+	p->last_pose_ms = 0;
+	if (p->pose_on && !keep.empty()) {
+		if (!p->pose_loaded) {
+			p->pose_loaded = true;
+			p->pose_net.clear();
+			p->pose_net.opt.use_vulkan_compute = false;
+			p->pose_net.opt.num_threads = 1;
+			blog(LOG_INFO, "body pose: loading '%s'", p->pose_param.c_str());
+			p->pose_error = p->pose_net.load_param(p->pose_param.c_str()) != 0 ||
+					p->pose_net.load_model(p->pose_bin.c_str()) != 0;
+			if (p->pose_error)
+				blog(LOG_ERROR,
+				     "body pose: could not load the model files '%s' and '%s'; following without it",
+				     p->pose_param.c_str(), p->pose_bin.c_str());
+		}
+		int best = -1;
+		float best_iou = 0.3f;
+		for (size_t i = 0; i < keep.size(); i++) {
+			const pt_det &d = keep[i];
+			const float ix = std::min(d.x1, p->hint[2]) - std::max(d.x0, p->hint[0]);
+			const float iy = std::min(d.y1, p->hint[3]) - std::max(d.y0, p->hint[1]);
+			if (ix <= 0.0f || iy <= 0.0f)
+				continue;
+			const float uni = (d.x1 - d.x0) * (d.y1 - d.y0) +
+					  (p->hint[2] - p->hint[0]) * (p->hint[3] - p->hint[1]) - ix * iy;
+			const float iou = ix * iy / std::max(1.0f, uni);
+			if (iou > best_iou) {
+				best_iou = iou;
+				best = (int)i;
+			}
+		}
+		if (best >= 0 && !p->pose_error) {
+			const uint64_t t_pose = os_gettime_ns();
+			pt_det &d = keep[best];
+			if (pd_pose(p->pose_net, img, d.x0 / scale, d.y0 / scale, d.x1 / scale, d.y1 / scale, d.kp)) {
+				for (int k = 0; k < PT_KP; k++) {
+					d.kp[k][0] *= scale;
+					d.kp[k][1] *= scale;
+				}
+				d.has_kp = true;
+			}
+			p->last_pose_ms = (int)((os_gettime_ns() - t_pose) / 1000000);
+		}
 	}
 	p->persons.swap(keep);
 	if (p->n_error)

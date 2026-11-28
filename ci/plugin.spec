@@ -76,6 +76,7 @@ mv %{buildroot}/%{_datadir}/obs/obs-plugins/@PLUGIN_NAME@/LICENSE-shape_predicto
 %{_datadir}/obs/obs-plugins/@PLUGIN_NAME@/dlib_face_landmark_model/shape_predictor_5_face_landmarks.dat
 %{_datadir}/obs/obs-plugins/@PLUGIN_NAME@/dlib_hog_model
 %{_datadir}/obs/obs-plugins/@PLUGIN_NAME@/person_model
+%{_datadir}/obs/obs-plugins/@PLUGIN_NAME@/pose_model
 %{_datadir}/licenses/%{name}-data/*
 
 %files data-nonfree

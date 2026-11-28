@@ -4,30 +4,27 @@
 #include <cstdio>
 #include <cstring>
 
-// All distances below are measured in "body heights" (the height of the presenter's box), so the same numbers
-// work for a wide shot and a close shot.
+// All distances below are measured in "body heights" (the height of the person's box), so the same numbers work
+// for a wide shot and a close shot.
 static const float GATE_STILL = 0.35f; // how far a detection may be from the prediction straight away
 static const float GATE_SPEED = 1.5f;  // and how much further per second without a sighting (a brisk walk)
 static const float GATE_MAX = 3.0f;
-static const float ACC = 3.0f;   // body heights / s^2 the motion model allows for
-static const float MEAS = 0.03f; // detector box noise, body heights
-// Clothing colours, 0 = nothing in common, 1 = identical. Measured on stage footage: the same person scores
-// 0.68 or more against their running average, other people 0.4 or less.
-static const float SIM_REJECT = 0.5f;    // below this it is somebody else, even if they stand exactly where the
-					 // presenter was (somebody walking in front must not take the lock)
-static const float SIM_LEARN = 0.6f;     // only clear sightings update the stored colours
-static const float SIM_REACQUIRE = 0.6f; // colours this similar: the lost presenter is back
+static const float ACC = 3.0f;    // body heights / s^2 the motion model allows for
+static const float MEAS = 0.03f;  // detector box noise, body heights
+static const float FORGET = 1.5f; // s. Other people are forgotten this long after they were last seen
+// Clothing colours, 0 = nothing in common, 1 = identical. Measured on stage footage: the same person scores 0.68 or
+// more against their running average, other people 0.4 or less.
+static const float SIM_SAME = 0.6f;     // this similar: the same person (used to take a lost presenter back)
+static const float SIM_NEW_VIEW = 0.7f; // below this against every remembered view: remember this view as well
 
 void presenter_tracker::reset()
 {
-	st = st_search;
-	have_sig = false;
-	cand_valid = false;
-	cand_hits = 0;
-	t_state = t_seen = 0.0;
-	w = h = 0.0f;
-	cx = top = axis_s{0, 0, 0, 0, 0};
-	memset(sig, 0, sizeof(sig));
+	tracks.clear();
+	next_id = 1;
+	presenter_id = 0;
+	lost_reported = false;
+	have_request = false;
+	req_x = req_y = 0.0f;
 }
 
 void presenter_tracker::ax_init(axis_s &a, float p, float r)
@@ -67,210 +64,368 @@ float presenter_tracker::similarity(const float *a, const float *b)
 	float s = 0.0f;
 	for (int i = 0; i < PT_SIG; i++)
 		s += std::min(a[i], b[i]);
-	return s; // 1 = identical colours, 0 = nothing in common
+	return s;
 }
 
-void presenter_tracker::advance(double t)
+// How well the clothing of a detection matches a track: the best of the remembered views. 1 when unknown.
+float presenter_tracker::track_similarity(const track_s &tr, const pt_det &d)
 {
-	float dt = (float)(t - t_state);
-	if (dt <= 0.0f)
-		return;
-	if (dt > 1.0f)
-		dt = 1.0f;
-	ax_predict(cx, dt, ACC * h);
-	ax_predict(top, dt, ACC * h);
-	t_state = t;
+	if (!d.has_sig || tr.n_sig == 0)
+		return 1.0f;
+	float best = 0.0f;
+	for (int i = 0; i < tr.n_sig; i++)
+		best = std::max(best, similarity(tr.sig[i], d.sig));
+	return best;
 }
 
-void presenter_tracker::lock_on(const pt_det &d, double t, const char *why)
+presenter_tracker::track_s *presenter_tracker::presenter()
 {
-	w = d.x1 - d.x0;
-	h = d.y1 - d.y0;
-	ax_init(cx, (d.x0 + d.x1) * 0.5f, MEAS * h);
-	ax_init(top, d.y0, MEAS * h);
-	t_state = t_seen = t;
+	for (size_t i = 0; i < tracks.size(); i++)
+		if (tracks[i].id == presenter_id)
+			return &tracks[i];
+	return nullptr;
+}
+
+const presenter_tracker::track_s *presenter_tracker::presenter() const
+{
+	for (size_t i = 0; i < tracks.size(); i++)
+		if (tracks[i].id == presenter_id)
+			return &tracks[i];
+	return nullptr;
+}
+
+void presenter_tracker::start_track(const pt_det &d, double t)
+{
+	track_s tr;
+	tr.id = next_id++;
+	tr.w = d.x1 - d.x0;
+	tr.h = d.y1 - d.y0;
+	ax_init(tr.cx, (d.x0 + d.x1) * 0.5f, MEAS * tr.h);
+	ax_init(tr.top, d.y0, MEAS * tr.h);
+	tr.t_state = tr.t_seen = t;
+	tr.hits = 1;
+	tr.confirmed = false;
+	tr.n_sig = 0;
+	tr.next_sig = 1;
+	memset(tr.sig, 0, sizeof(tr.sig));
 	if (d.has_sig) {
-		memcpy(sig, d.sig, sizeof(sig));
-		have_sig = true;
+		memcpy(tr.sig[0], d.sig, sizeof(tr.sig[0]));
+		tr.n_sig = 1;
 	}
-	st = st_locked;
-	cand_valid = false;
-	cand_hits = 0;
-	char b[160];
-	snprintf(b, sizeof b, "presenter: %s (%dx%d px at %d,%d, confidence %.2f)", why, (int)w, (int)h, (int)d.x0,
-		 (int)d.y0, d.score);
+	tracks.push_back(tr);
+}
+
+void presenter_tracker::say(const char *what, const track_s *tr)
+{
+	char b[200];
+	if (tr)
+		snprintf(b, sizeof b, "presenter: %s (person %d, %dx%d px at %d,%d; %d people in view)", what, tr->id,
+			 (int)tr->w, (int)tr->h, (int)(tr->cx.p - tr->w * 0.5f), (int)tr->top.p, people());
+	else
+		snprintf(b, sizeof b, "presenter: %s (%d people in view)", what, people());
 	event = b;
+}
+
+void presenter_tracker::request_lock(float x, float y)
+{
+	have_request = true;
+	req_x = x;
+	req_y = y;
 }
 
 void presenter_tracker::update(const std::vector<pt_det> &dets, double t)
 {
-	if (st != st_search) {
-		advance(t);
-		const float since = (float)(t - t_seen);
-		const float gate = std::min(GATE_MAX, GATE_STILL + GATE_SPEED * since);
+	// 1. move every track forward to the time of this picture
+	for (size_t i = 0; i < tracks.size(); i++) {
+		track_s &tr = tracks[i];
+		float dt = (float)(t - tr.t_state);
+		if (dt > 0.0f) {
+			if (dt > 1.0f)
+				dt = 1.0f;
+			// a track that has not been seen for a while stops where it is
+			if (t - tr.t_seen > coast_time)
+				tr.cx.v = tr.top.v = 0.0f;
+			ax_predict(tr.cx, dt, ACC * tr.h);
+			ax_predict(tr.top, dt, ACC * tr.h);
+			tr.t_state = t;
+		}
+	}
 
-		// the detection that is most plausibly the presenter
-		int best = -1;
-		float best_cost = 1e9f, best_iou = 0.0f, best_sim = 0.0f;
-		const float px0 = cx.p - w * 0.5f, px1 = cx.p + w * 0.5f, py0 = top.p, py1 = top.p + h;
-		for (size_t i = 0; i < dets.size(); i++) {
-			const pt_det &d = dets[i];
+	// 2. give each detection to the track it fits best (cheapest pairs first)
+	struct pair_s
+	{
+		float cost;
+		int ti, di;
+		float iou, sim;
+	};
+	std::vector<pair_s> pairs;
+	for (size_t ti = 0; ti < tracks.size(); ti++) {
+		const track_s &tr = tracks[ti];
+		const float since = (float)(t - tr.t_seen);
+		const float gate = std::min(GATE_MAX, GATE_STILL + GATE_SPEED * since);
+		const float px0 = tr.cx.p - tr.w * 0.5f, px1 = tr.cx.p + tr.w * 0.5f;
+		const float py0 = tr.top.p, py1 = tr.top.p + tr.h;
+		for (size_t di = 0; di < dets.size(); di++) {
+			const pt_det &d = dets[di];
 			if (d.score < conf_keep)
 				continue;
 			const float dh = d.y1 - d.y0, dw = d.x1 - d.x0;
 			if (dh <= 1.0f || dw <= 1.0f)
 				continue;
-			const float ex = ((d.x0 + d.x1) * 0.5f - cx.p) / h;
-			const float ey = (d.y0 - top.p) / h;
+			const float ex = ((d.x0 + d.x1) * 0.5f - tr.cx.p) / tr.h;
+			const float ey = (d.y0 - tr.top.p) / tr.h;
 			const float dist = sqrtf(ex * ex + ey * ey);
 			if (dist > gate)
 				continue;
-			const float ratio = dh / h;
+			const float ratio = dh / tr.h;
 			if (ratio < 0.45f ||
-			    ratio > 1.8f) // a lectern may hide the legs; a different person is a different size
+			    ratio > 1.8f) // a lectern may hide the legs; another person is another size
 				continue;
 			const float ix = std::min(px1, d.x1) - std::max(px0, d.x0);
 			const float iy = std::min(py1, d.y1) - std::max(py0, d.y0);
 			const float inter = (ix > 0 && iy > 0) ? ix * iy : 0.0f;
-			const float iou = inter / (w * h + dw * dh - inter);
-			float sim = 1.0f;
-			if (have_sig && d.has_sig) {
-				sim = similarity(sig, d.sig);
-				if (sim < SIM_REJECT)
-					continue;
-			}
-			const float cost = 0.6f * dist / gate + 0.4f * (1.0f - sim);
-			if (cost < best_cost) {
-				best_cost = cost;
-				best = (int)i;
-				best_iou = iou;
-				best_sim = sim;
-			}
+			pair_s p;
+			p.iou = inter / (tr.w * tr.h + dw * dh - inter);
+			p.sim = track_similarity(tr, d);
+			p.cost = 0.5f * dist / gate + 0.5f * (1.0f - p.sim);
+			p.ti = (int)ti;
+			p.di = (int)di;
+			pairs.push_back(p);
 		}
+	}
+	std::sort(pairs.begin(), pairs.end(), [](const pair_s &a, const pair_s &b) { return a.cost < b.cost; });
+	std::vector<char> track_used(tracks.size(), 0), det_used(dets.size(), 0);
+	for (size_t k = 0; k < pairs.size(); k++) {
+		const pair_s &p = pairs[k];
+		if (track_used[p.ti] || det_used[p.di])
+			continue;
+		track_used[p.ti] = det_used[p.di] = 1;
+		track_s &tr = tracks[p.ti];
+		const pt_det &d = dets[p.di];
+		ax_update(tr.cx, (d.x0 + d.x1) * 0.5f, MEAS * tr.h);
+		ax_update(tr.top, d.y0, MEAS * tr.h);
+		tr.w += 0.3f * ((d.x1 - d.x0) - tr.w);
+		tr.h += 0.3f * ((d.y1 - d.y0) - tr.h);
+		tr.t_seen = t;
+		if (!tr.confirmed && ++tr.hits >= confirm_hits)
+			tr.confirmed = true;
 
-		if (best >= 0) {
-			const pt_det &d = dets[best];
-			const float dh = d.y1 - d.y0, dw = d.x1 - d.x0;
-			ax_update(cx, (d.x0 + d.x1) * 0.5f, MEAS * h);
-			ax_update(top, d.y0, MEAS * h);
-			w += 0.3f * (dw - w);
-			h += 0.3f * (dh - h);
-			if (d.has_sig && best_iou > 0.5f &&
-			    (!have_sig || best_sim > SIM_LEARN)) { // colours drift slowly with the light
-				if (!have_sig) {
-					memcpy(sig, d.sig, sizeof(sig));
-					have_sig = true;
+		// Clothing: follow slow changes of the best-matching view, and remember a new view when the person has
+		// turned. Only while nobody else is close, so that somebody passing in front is never learned.
+		if (d.has_sig && p.iou > 0.5f) {
+			bool alone = true;
+			for (size_t j = 0; j < tracks.size() && alone; j++) {
+				if ((int)j == p.ti)
+					continue;
+				alone = fabsf(tracks[j].cx.p - tr.cx.p) > (tracks[j].w + tr.w) * 0.75f;
+			}
+			if (tr.n_sig == 0) {
+				memcpy(tr.sig[0], d.sig, sizeof(tr.sig[0]));
+				tr.n_sig = 1;
+			} else if (alone) {
+				int best = 0;
+				float best_sim = -1.0f;
+				for (int i = 0; i < tr.n_sig; i++) {
+					const float s = similarity(tr.sig[i], d.sig);
+					if (s > best_sim) {
+						best_sim = s;
+						best = i;
+					}
+				}
+				if (best_sim < SIM_NEW_VIEW) {
+					const int slot = tr.n_sig < PT_GALLERY ? tr.n_sig++ : tr.next_sig;
+					memcpy(tr.sig[slot], d.sig, sizeof(tr.sig[slot]));
+					tr.next_sig = 1 + (tr.next_sig % (PT_GALLERY - 1)); // the first view is kept
 				} else {
 					for (int i = 0; i < PT_SIG; i++)
-						sig[i] += 0.1f * (d.sig[i] - sig[i]);
+						tr.sig[best][i] += 0.1f * (d.sig[i] - tr.sig[best][i]);
 				}
 			}
-			if (st != st_locked)
-				event = "presenter: seen again, following";
-			st = st_locked;
-			t_seen = t;
-			return;
 		}
+	}
 
-		// not seen this time
-		if (since <= coast_time) {
-			if (st == st_locked)
-				st = st_coast;
-			return;
-		}
-		if (st != st_lost) {
-			st = st_lost;
-			cx.v = top.v = 0.0f;
-			event = "presenter: not seen, camera holds";
-		}
-
-		// The same person coming back is taken at once, wherever they are.
-		if (have_sig) {
-			int back = -1;
-			float back_sim = SIM_REACQUIRE;
-			for (size_t i = 0; i < dets.size(); i++) {
-				if (dets[i].score < conf_new || !dets[i].has_sig)
-					continue;
-				const float sim = similarity(sig, dets[i].sig);
-				if (sim > back_sim) {
-					back_sim = sim;
-					back = (int)i;
-				}
-			}
-			if (back >= 0) {
-				lock_on(dets[back], t, "the same person is back");
-				return;
+	// 3. a lost presenter who is back somewhere else: recognised by the clothing
+	track_s *pr = presenter();
+	if (pr && t - pr->t_seen > coast_time && pr->n_sig > 0) {
+		int back = -1;
+		float back_sim = SIM_SAME;
+		for (size_t di = 0; di < dets.size(); di++) {
+			if (det_used[di] || dets[di].score < conf_new || !dets[di].has_sig)
+				continue;
+			const float sim = track_similarity(*pr, dets[di]);
+			if (sim > back_sim) {
+				back_sim = sim;
+				back = (int)di;
 			}
 		}
-		if (since < lock_hold)
-			return;
-		// Held long enough: anybody may become the presenter now.
-		event = "presenter: gone, looking for a new one";
-		st = st_search;
-		have_sig = false;
-		cand_valid = false;
-	}
-
-	// ---- nobody locked: find a presenter. The biggest, most confident person wins, but only after being seen
-	// several times in a row in about the same place.
-	int best = -1;
-	float best_w = 0.0f;
-	for (size_t i = 0; i < dets.size(); i++) {
-		const pt_det &d = dets[i];
-		if (d.score < conf_new)
-			continue;
-		const float weight = d.score * (d.y1 - d.y0);
-		if (weight > best_w) {
-			best_w = weight;
-			best = (int)i;
+		if (back >= 0) {
+			const pt_det &d = dets[back];
+			det_used[back] = 1;
+			pr->w = d.x1 - d.x0;
+			pr->h = d.y1 - d.y0;
+			ax_init(pr->cx, (d.x0 + d.x1) * 0.5f, MEAS * pr->h);
+			ax_init(pr->top, d.y0, MEAS * pr->h);
+			pr->t_state = pr->t_seen = t;
 		}
 	}
-	if (best < 0) {
-		if (cand_valid && t - cand_t > 1.5)
-			cand_valid = false;
-		return;
+
+	// ...or who has already been picked up as a "new" person: that track becomes the presenter's
+	pr = presenter();
+	if (pr && t - pr->t_seen > coast_time && pr->n_sig > 0) {
+		int back = -1;
+		float back_sim = SIM_SAME;
+		for (size_t i = 0; i < tracks.size(); i++) {
+			const track_s &o = tracks[i];
+			if (o.id == presenter_id || o.n_sig == 0 || t - o.t_seen > 0.3)
+				continue;
+			float sim = 0.0f;
+			for (int a = 0; a < pr->n_sig; a++)
+				for (int b = 0; b < o.n_sig; b++)
+					sim = std::max(sim, similarity(pr->sig[a], o.sig[b]));
+			if (sim > back_sim) {
+				back_sim = sim;
+				back = (int)i;
+			}
+		}
+		if (back >= 0) {
+			const track_s o = tracks[back];
+			pr->cx = o.cx;
+			pr->top = o.top;
+			pr->w = o.w;
+			pr->h = o.h;
+			pr->t_state = o.t_state;
+			pr->t_seen = o.t_seen;
+			tracks.erase(tracks.begin() + back);
+		}
 	}
-	const pt_det &d = dets[best];
-	const float dcx = (d.x0 + d.x1) * 0.5f, dh = d.y1 - d.y0;
-	if (cand_valid && t - cand_t <= 1.5 && fabsf(dcx - cand_cx) < 0.5f * cand_h &&
-	    fabsf(d.y0 - cand_top) < 0.5f * cand_h) {
-		cand_hits++;
-	} else {
-		cand_valid = true;
-		cand_hits = 1;
+
+	// 4. detections nobody claimed are new people
+	for (size_t di = 0; di < dets.size(); di++) {
+		if (!det_used[di] && dets[di].score >= conf_new)
+			start_track(dets[di], t);
 	}
-	cand_cx = dcx;
-	cand_top = d.y0;
-	cand_h = dh;
-	cand_t = t;
-	if (cand_hits >= confirm_hits)
-		lock_on(d, t, "locked on");
+
+	// 5. forget people who have gone. The presenter is kept: for lock_hold seconds in automatic mode, and until
+	// the operator says otherwise in manual mode.
+	for (size_t i = 0; i < tracks.size();) {
+		const track_s &tr = tracks[i];
+		const float since = (float)(t - tr.t_seen);
+		bool drop = since > FORGET || (!tr.confirmed && since > 0.5f);
+		if (tr.id == presenter_id)
+			drop = !manual && since > lock_hold;
+		if (drop) {
+			const bool was_presenter = tr.id == presenter_id;
+			tracks.erase(tracks.begin() + i);
+			if (was_presenter) {
+				presenter_id = 0;
+				say("gone, looking for a new one", nullptr);
+			}
+		} else {
+			i++;
+		}
+	}
+
+	// 6. who is the presenter?
+	if (have_request) {
+		have_request = false;
+		const track_s *best = nullptr;
+		float best_d = 1e18f;
+		for (size_t i = 0; i < tracks.size(); i++) {
+			const track_s &tr = tracks[i];
+			if (t - tr.t_seen > 0.5)
+				continue;
+			// distance from the requested point to the person's upper body
+			const float dx = tr.cx.p - req_x, dy = (tr.top.p + 0.25f * tr.h) - req_y;
+			const float d2 = dx * dx + dy * dy;
+			if (d2 < best_d) {
+				best_d = d2;
+				best = &tr;
+			}
+		}
+		if (best) {
+			presenter_id = best->id;
+			lost_reported = false;
+			say("locked by the operator", best);
+		} else {
+			say("lock requested, but nobody is in view", nullptr);
+		}
+	} else if (presenter_id == 0 && !manual) {
+		const track_s *best = nullptr;
+		float best_h = 0.0f;
+		for (size_t i = 0; i < tracks.size(); i++) {
+			const track_s &tr = tracks[i];
+			if (!tr.confirmed || t - tr.t_seen > 0.3)
+				continue;
+			if (tr.h > best_h) {
+				best_h = tr.h;
+				best = &tr;
+			}
+		}
+		if (best) {
+			presenter_id = best->id;
+			lost_reported = false;
+			say("locked on", best);
+		}
+	}
+
+	// 7. report losing and finding the presenter
+	pr = presenter();
+	if (pr) {
+		const bool lost = t - pr->t_seen > coast_time;
+		if (lost && !lost_reported)
+			say("not seen, camera holds", pr);
+		else if (!lost && lost_reported)
+			say("seen again, following", pr);
+		lost_reported = lost;
+	}
+}
+
+presenter_tracker::state_e presenter_tracker::state() const
+{
+	const track_s *pr = presenter();
+	if (!pr)
+		return st_search;
+	const double since = pr->t_state - pr->t_seen;
+	if (since > coast_time)
+		return st_lost;
+	return since > 0.0 ? st_coast : st_locked;
+}
+
+int presenter_tracker::people() const
+{
+	int n = 0;
+	for (size_t i = 0; i < tracks.size(); i++)
+		if (tracks[i].confirmed)
+			n++;
+	return n;
 }
 
 bool presenter_tracker::predict(double t, float &x0, float &y0, float &x1, float &y1) const
 {
-	if (st == st_search || st == st_lost)
+	const track_s *pr = presenter();
+	if (!pr || pr->t_state - pr->t_seen > coast_time)
 		return false;
 	// Look ahead from the last filter state, but never far: a wrong guess must not swing the camera.
-	float dt = (float)(t - t_state);
+	float dt = (float)(t - pr->t_state);
 	if (dt < 0.0f)
 		dt = 0.0f;
 	if (dt > 0.4f)
 		dt = 0.4f;
-	const float c = cx.p + cx.v * dt;
-	const float ty = top.p + top.v * dt;
-	x0 = c - w * 0.5f;
-	x1 = c + w * 0.5f;
+	const float c = pr->cx.p + pr->cx.v * dt;
+	const float ty = pr->top.p + pr->top.v * dt;
+	x0 = c - pr->w * 0.5f;
+	x1 = c + pr->w * 0.5f;
 	y0 = ty;
-	y1 = ty + h;
+	y1 = ty + pr->h;
 	return true;
 }
 
 void presenter_tracker::velocity(float &vx, float &vy) const
 {
-	if (st == st_locked || st == st_coast) {
-		vx = cx.v;
-		vy = top.v;
+	const track_s *pr = presenter();
+	if (pr && pr->t_state - pr->t_seen <= coast_time) {
+		vx = pr->cx.v;
+		vy = pr->top.v;
 	} else {
 		vx = vy = 0.0f;
 	}

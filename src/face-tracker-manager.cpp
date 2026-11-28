@@ -324,6 +324,7 @@ inline void face_tracker_manager::stage_to_detector()
 				std::vector<pt_det> persons;
 				d->get_persons(persons);
 				presenter.lock_hold = lock_hold;
+				presenter.manual = follow_manual;
 				presenter.update(persons, presenter_det_time);
 				float bx, by;
 				camera_speed_known = d->get_background_speed(bx, by);
@@ -603,6 +604,7 @@ void face_tracker_manager::update(obs_data_t *settings)
 	if (_detector_engine != detector_engine)
 		update_detector(this, _detector_engine);
 	person_model = obs_data_get_string(settings, "person_model");
+	follow_manual = strcmp(obs_data_get_string(settings, "follow_mode"), "manual") == 0;
 	person_interval = (float)obs_data_get_double(settings, "person_interval");
 	if (person_interval < 0.05f)
 		person_interval = 0.05f;
@@ -676,6 +678,15 @@ void face_tracker_manager::get_properties(obs_properties_t *pp)
 	p = obs_properties_add_int(pp, "detector_crop_b",
 				   obs_module_text("Search area: ignore this much at the bottom"), 0, 1080, 1);
 	obs_property_int_set_suffix(p, " px");
+	p = obs_properties_add_list(pp, "follow_mode", obs_module_text("Who to follow"), OBS_COMBO_TYPE_LIST,
+				    OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(p, obs_module_text("Automatic: the biggest person in the search area"), "auto");
+	obs_property_list_add_string(p, obs_module_text("Manual: only the person I lock on, never anybody else"),
+				     "manual");
+	obs_property_set_long_description(
+		p, obs_module_text("Manual: aim the camera so the person is on the yellow cross and press the Lock "
+				   "button (or its hotkey). The camera then stays with that person. If they leave "
+				   "the picture it waits for them, and never picks somebody else by itself."));
 	p = obs_properties_add_list(pp, "person_model", obs_module_text("Person detection quality"),
 				    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(p, obs_module_text("Accurate (default)"), "tiny");
@@ -715,7 +726,8 @@ void face_tracker_manager::get_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, "detect_interval", 1.0);
 	obs_data_set_default_double(settings, "lock_hold", 6.0);
 	obs_data_set_default_string(settings, "person_model", "tiny");
-	obs_data_set_default_double(settings, "person_interval", 0.15);
+	obs_data_set_default_double(settings, "person_interval", 0.1);
+	obs_data_set_default_string(settings, "follow_mode", "auto");
 	obs_data_set_default_bool(settings, "tracking_th_en", true);
 	obs_data_set_default_double(settings, "tracking_th_dB", -80.0);
 

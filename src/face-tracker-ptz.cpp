@@ -67,6 +67,8 @@ public:
 	std::shared_ptr<texture_object> get_cvtex() override { return cvtex_cache; };
 };
 
+static void lock_on_person_at_cross(struct face_tracker_ptz *s);
+
 static const char *ftptz_get_name(void *unused)
 {
 	UNUSED_PARAMETER(unused);
@@ -206,6 +208,14 @@ static void ftptz_update(void *data, obs_data_t *settings)
 	s->zone_x = (float)obs_data_get_double(settings, "zone_x") * 1e-2f;
 	s->zone_y = (float)obs_data_get_double(settings, "zone_y") * 1e-2f;
 	s->zone_anticipation = (float)obs_data_get_double(settings, "zone_anticipation");
+	s->zone_strength = (float)obs_data_get_double(settings, "zone_strength");
+	if (s->zone_strength < 0.2f)
+		s->zone_strength = 1.0f;
+	// The phone page asks for a lock by changing this number.
+	const long long lock_request = obs_data_get_int(settings, "lock_request");
+	if (s->lock_request_seen >= 0 && lock_request != s->lock_request_seen)
+		lock_on_person_at_cross(s);
+	s->lock_request_seen = lock_request;
 	s->e_deadband.v[0] = (float)obs_data_get_double(settings, "e_deadband_x") * 1e-2;
 	s->e_deadband.v[1] = (float)obs_data_get_double(settings, "e_deadband_y") * 1e-2;
 	s->e_deadband.v[2] = (float)obs_data_get_double(settings, "e_deadband_z") * 1e-2;
@@ -286,6 +296,8 @@ static void *ftptz_create(obs_data_t *settings, obs_source_t *context)
 	s->ftm->scale = 2.0f;
 	s->hotkey_pause = OBS_INVALID_HOTKEY_PAIR_ID;
 	s->hotkey_reset = OBS_INVALID_HOTKEY_ID;
+	s->hotkey_lock = OBS_INVALID_HOTKEY_ID;
+	s->lock_request_seen = -1;
 
 	obs_source_update(context, settings);
 
@@ -308,6 +320,8 @@ static void ftptz_destroy(void *data)
 		obs_hotkey_pair_unregister(s->hotkey_pause);
 	if (s->hotkey_reset != OBS_INVALID_HOTKEY_ID)
 		obs_hotkey_unregister(s->hotkey_reset);
+	if (s->hotkey_lock != OBS_INVALID_HOTKEY_ID)
+		obs_hotkey_unregister(s->hotkey_lock);
 
 	delete s->ftm;
 	bfree(s->ptz_type);
@@ -325,6 +339,20 @@ static void ftptz_destroy(void *data)
 	bfree(s->scaler_buffer);
 
 	bfree(s);
+}
+
+// Operator: follow the person who is nearest to the yellow cross right now.
+static void lock_on_person_at_cross(struct face_tracker_ptz *s)
+{
+	const float x = (float)s->known_width * (0.5f + s->track_x);
+	const float y = (float)s->known_height * (0.5f - s->track_y);
+	s->ftm->presenter.request_lock(x, y);
+}
+
+static bool ftptz_lock_person(obs_properties_t *, obs_property_t *, void *data)
+{
+	lock_on_person_at_cross((struct face_tracker_ptz *)data);
+	return false;
 }
 
 static bool ftptz_reset_tracking(obs_properties_t *, obs_property_t *, void *data)
@@ -380,6 +408,8 @@ static bool show_advanced_modified(obs_properties_t *props, obs_property_t *, ob
 		"person_interval",
 		"e_deadband_x",
 		"e_deadband_y",
+		"Kp_x_db",
+		"Kp_y_db",
 		"detector_dlib_cnn_model",
 		"detector_upsample",
 		"detect_interval",
@@ -429,6 +459,8 @@ static obs_properties_t *ftptz_properties(void *data)
 	obs_property_t *p_adv =
 		obs_properties_add_bool(props, "show_advanced", obs_module_text("Show advanced settings"));
 	obs_property_set_modified_callback(p_adv, show_advanced_modified);
+	obs_properties_add_button(props, "ftptz_lock_person",
+				  obs_module_text("LOCK on the person nearest the yellow cross"), ftptz_lock_person);
 	obs_properties_add_button(props, "ftptz_reset_tracking",
 				  obs_module_text("Start over: forget the current target"), ftptz_reset_tracking);
 
@@ -514,6 +546,15 @@ static obs_properties_t *ftptz_properties(void *data)
 		p = obs_properties_add_float_slider(pp, "zone_y", obs_module_text("Rest zone, up and down"), 2.0, 40.0,
 						    1.0);
 		obs_property_float_set_suffix(p, " % of the height");
+		p = obs_properties_add_list(pp, "zone_strength", obs_module_text("How firmly to bring the person back"),
+					    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_FLOAT);
+		obs_property_list_add_float(p, obs_module_text("Gentle"), 0.6);
+		obs_property_list_add_float(p, obs_module_text("Normal"), 1.0);
+		obs_property_list_add_float(p, obs_module_text("Firm (fast walkers)"), 1.6);
+		obs_property_set_long_description(
+			p,
+			obs_module_text("This replaces fine-tuning the pan and tilt speed: the plugin measures how the "
+					"head really answers and adjusts its commands by itself."));
 		p = obs_properties_add_float_slider(pp, "zone_anticipation", obs_module_text("Move with the person"),
 						    0.0, 1.2, 0.05);
 		obs_property_set_long_description(
@@ -647,6 +688,8 @@ static void ftptz_get_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, "zone_x", 10.0);
 	obs_data_set_default_double(settings, "zone_y", 10.0);
 	obs_data_set_default_double(settings, "zone_anticipation", 1.0);
+	obs_data_set_default_double(settings, "zone_strength", 1.0);
+	obs_data_set_default_int(settings, "lock_request", 0);
 	if (face_tracker_manager::person_engine_available()) {
 		obs_data_set_default_int(settings, "detector_engine", (int)face_tracker_manager::engine_person);
 		obs_data_set_default_double(settings, "scale", 2.0); // a whole person is big: half size is plenty
@@ -820,10 +863,24 @@ static void hotkey_cb_reset(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, 
 		ftptz_reset_tracking(NULL, NULL, data);
 }
 
+static void hotkey_cb_lock(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
+{
+	UNUSED_PARAMETER(id);
+	UNUSED_PARAMETER(hotkey);
+	if (pressed)
+		lock_on_person_at_cross((struct face_tracker_ptz *)data);
+}
+
 static void register_hotkeys(struct face_tracker_ptz *s, obs_source_t *target)
 {
 	if (!target)
 		return;
+
+	if (s->hotkey_lock == OBS_INVALID_HOTKEY_ID) {
+		s->hotkey_lock = obs_hotkey_register_source(
+			target, "face-tracker.lock",
+			obs_module_text("Face Tracker PTZ: lock on the person at the cross"), hotkey_cb_lock, s);
+	}
 
 	if (s->hotkey_pause == OBS_INVALID_HOTKEY_PAIR_ID) {
 		s->hotkey_pause = obs_hotkey_pair_register_source(target, "face-tracker.pause",
@@ -856,7 +913,7 @@ static void tick_filter(struct face_tracker_ptz *s, float second)
 			const float size = i == 0 ? (float)s->known_width : (float)s->known_height;
 			const float outer = (i == 0 ? s->zone_x : s->zone_y) * size;
 			const float inner = outer * 0.3f;
-			const float K = 1.0f; // 1/s: the response the speed settings are designed for
+			const float K = 1.0f; // 1/s: how a calibrated head answers with the speed settings as designed
 			// The person's own speed is what the detector sees plus what the camera's movement takes away.
 			// The camera's movement is measured from the background sliding across the picture. If that
 			// cannot be measured (a plain wall), it is estimated from what was asked of the head.
@@ -901,7 +958,12 @@ static void tick_filter(struct face_tracker_ptz *s, float second)
 				// position: bring the person to the middle. speed: travel with them. Without a measured
 				// camera speed the second part is only an estimate, so it is used at half strength.
 				const float ff = s->zone_anticipation * (measured ? 1.0f : 0.5f);
-				cmd = (K * x + ff * s->zone_v[i]) / (K * s->zone_gain[i]);
+				// How firmly to pull the person back: the chosen strength, and firmer still when they are
+				// far from the middle and about to leave the picture.
+				float pull = s->zone_strength;
+				if (std::abs(x) > 0.3f * size)
+					pull *= 1.6f;
+				cmd = (pull * x + ff * s->zone_v[i]) / (K * s->zone_gain[i]);
 				const float cmd_max = 0.6f * size;
 				cmd = std::max(-cmd_max, std::min(cmd_max, cmd));
 			}

@@ -56,8 +56,9 @@ public: // properties
 	uint64_t target_confirmed_ns = 0;
 	int diag_target_state = 0;
 	// person engine
-	std::string person_model;      // "tiny" (accurate) or "nano" (fast)
-	float person_interval = 0.15f; // seconds between detector runs
+	std::string person_model;     // "tiny" (accurate) or "nano" (fast)
+	float person_interval = 0.1f; // seconds between detector runs
+	bool follow_manual = false;   // only the operator chooses who is followed
 	presenter_tracker presenter;
 	double presenter_det_time = 0.0;                // when the picture now in the detector was taken
 	float presenter_vx = 0.0f, presenter_vy = 0.0f; // presenter's speed across the picture, px/s

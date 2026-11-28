@@ -74,4 +74,7 @@ struct face_tracker_ptz
 	bool is_paused;
 	obs_hotkey_pair_id hotkey_pause;
 	obs_hotkey_id hotkey_reset;
+	obs_hotkey_id hotkey_lock;
+	long long lock_request_seen; // last value of the "lock_request" setting (changed by the phone page)
+	float zone_strength;         // how firmly the person is brought back to the middle (1 = normal)
 };

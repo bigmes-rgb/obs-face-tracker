@@ -328,6 +328,16 @@ jobs:
           cp dlib/LICENSE.txt data/LICENSE-dlib
           cp dlib-models/LICENSE data/LICENSE-dlib-models
 
+      # Most of the build time is the two big libraries (ncnn and dlib), which do not change. Keeping the build
+      # folder between runs means only the plugin's own files are compiled again.
+      - name: Restore build folder
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: win-build-obs${{ matrix.obs }}-${{ matrix.arch }}-${{ hashFiles('CMakeLists.txt', 'cmake/ncnn.cmake') }}-${{ github.sha }}
+          restore-keys: |
+            win-build-obs${{ matrix.obs }}-${{ matrix.arch }}-${{ hashFiles('CMakeLists.txt', 'cmake/ncnn.cmake') }}-
+
       - name: Build plugin
         run: |
 

@@ -67,6 +67,45 @@ public:
 	std::shared_ptr<texture_object> get_cvtex() override { return cvtex_cache; };
 };
 
+static void lock_on_person_at_cross(struct face_tracker_ptz *s);
+
+// The everyday settings are named choices. Each stands for a number; "custom" uses the number set under Advanced.
+struct choice_s
+{
+	const char *name;
+	double value;
+};
+static const choice_s ch_headroom[] = {{"tight", 18.0}, {"normal", 25.0}, {"generous", 32.0}, {NULL, 0}};
+static const choice_s ch_lead[] = {{"off", 0.0}, {"some", 5.0}, {"more", 9.0}, {NULL, 0}};
+static const choice_s ch_sens_w[] = {{"high", 12.0}, {"medium", 20.0}, {"low", 32.0}, {NULL, 0}};
+static const choice_s ch_sens_h[] = {{"high", 12.0}, {"medium", 20.0}, {"low", 28.0}, {NULL, 0}};
+static const choice_s ch_seats[] = {{"none", 0.0}, {"low", 15.0}, {"medium", 28.0}, {"high", 40.0}, {NULL, 0}};
+
+static double choice_value(obs_data_t *settings, const char *choice_key, const choice_s *table, const char *number_key)
+{
+	const char *c = obs_data_get_string(settings, choice_key);
+	for (int i = 0; table[i].name; i++)
+		if (strcmp(c, table[i].name) == 0)
+			return table[i].value;
+	return obs_data_get_double(settings, number_key);
+}
+
+// Settings from an older build: pick the named choice that matches the stored number, or "custom".
+static void choice_from_number(obs_data_t *settings, const char *choice_key, const choice_s *table,
+			       const char *number_key)
+{
+	if (obs_data_has_user_value(settings, choice_key) || !obs_data_has_user_value(settings, number_key))
+		return;
+	const double v = obs_data_get_double(settings, number_key);
+	for (int i = 0; table[i].name; i++) {
+		if (fabs(v - table[i].value) <= 1.5) {
+			obs_data_set_string(settings, choice_key, table[i].name);
+			return;
+		}
+	}
+	obs_data_set_string(settings, choice_key, "custom");
+}
+
 static const char *ftptz_get_name(void *unused)
 {
 	UNUSED_PARAMETER(unused);
@@ -185,8 +224,46 @@ static void ftptz_update(void *data, obs_data_t *settings)
 	s->ftm->update(settings);
 	s->ftm->scale = roundf(s->ftm->scale);
 	s->track_z = obs_data_get_double(settings, "track_z");
-	s->track_x = obs_data_get_double(settings, "track_x");
-	s->track_y = obs_data_get_double(settings, "track_y");
+	// Settings in plain units. Settings saved by older builds are converted once.
+	if (!obs_data_get_bool(settings, "ui_v2")) {
+		if (obs_data_has_user_value(settings, "track_y"))
+			obs_data_set_double(settings, "head_top_pct",
+					    (0.5 - obs_data_get_double(settings, "track_y")) * 100.0);
+		if (obs_data_has_user_value(settings, "track_x"))
+			obs_data_set_double(settings, "head_left_pct",
+					    (0.5 + obs_data_get_double(settings, "track_x")) * 100.0);
+		if (obs_data_has_user_value(settings, "zone_x"))
+			obs_data_set_double(settings, "zone_w_pct", obs_data_get_double(settings, "zone_x") * 2.0);
+		if (obs_data_has_user_value(settings, "zone_y"))
+			obs_data_set_double(settings, "zone_h_pct", obs_data_get_double(settings, "zone_y") * 2.0);
+		const double w = s->known_width ? (double)s->known_width : 1920.0;
+		const double h = s->known_height ? (double)s->known_height : 1080.0;
+		static const char *px[4] = {"detector_crop_l", "detector_crop_r", "detector_crop_t", "detector_crop_b"};
+		static const char *pct[4] = {"search_l_pct", "search_r_pct", "search_t_pct", "search_b_pct"};
+		for (int i = 0; i < 4; i++) {
+			if (obs_data_has_user_value(settings, px[i]))
+				obs_data_set_double(settings, pct[i],
+						    (double)obs_data_get_int(settings, px[i]) * 100.0 /
+							    (i < 2 ? w : h));
+		}
+		obs_data_set_bool(settings, "ui_v2", true);
+	}
+	if (!obs_data_get_bool(settings, "ui_v3")) {
+		choice_from_number(settings, "headroom", ch_headroom, "head_top_pct");
+		choice_from_number(settings, "lead", ch_lead, "lead_pct");
+		choice_from_number(settings, "sensitivity", ch_sens_w, "zone_w_pct");
+		choice_from_number(settings, "seats", ch_seats, "search_b_pct");
+		obs_data_set_bool(settings, "ui_v3", true);
+	}
+	s->track_x = obs_data_get_double(settings, "head_left_pct") * 0.01 - 0.5;
+	s->track_y = 0.5 - choice_value(settings, "headroom", ch_headroom, "head_top_pct") * 0.01;
+	s->pan_only = strcmp(obs_data_get_string(settings, "scope"), "pan") == 0;
+	s->search_pct[0] = (float)obs_data_get_double(settings, "search_l_pct");
+	s->search_pct[1] = (float)obs_data_get_double(settings, "search_r_pct");
+	s->search_pct[2] = (float)obs_data_get_double(settings, "search_t_pct");
+	s->search_pct[3] = (float)choice_value(settings, "seats", ch_seats, "search_b_pct");
+	s->pursuit_s = (float)obs_data_get_double(settings, "pursuit_s");
+	s->lead_frac = (float)choice_value(settings, "lead", ch_lead, "lead_pct") * 0.01f;
 
 	s->ki.v[0] = (float)obs_data_get_double(settings, "Ki_x");
 	s->ki.v[1] = (float)obs_data_get_double(settings, "Ki_y");
@@ -202,6 +279,18 @@ static void ftptz_update(void *data, obs_data_t *settings)
 	s->klpf.v[2] = obs_data_get_double(settings, "Td_z");
 	s->tlpf.v[0] = s->tlpf.v[1] = (float)obs_data_get_double(settings, "Tdlpf");
 	s->tlpf.v[2] = (float)obs_data_get_double(settings, "Tdlpf_z");
+	s->zone_mode = obs_data_get_bool(settings, "zone_mode");
+	s->zone_x = (float)choice_value(settings, "sensitivity", ch_sens_w, "zone_w_pct") * 0.5e-2f;
+	s->zone_y = (float)choice_value(settings, "sensitivity", ch_sens_h, "zone_h_pct") * 0.5e-2f;
+	s->zone_anticipation = (float)obs_data_get_double(settings, "zone_anticipation");
+	s->zone_strength = (float)obs_data_get_double(settings, "zone_strength");
+	if (s->zone_strength < 0.2f)
+		s->zone_strength = 1.0f;
+	// The phone page asks for a lock by changing this number.
+	const long long lock_request = obs_data_get_int(settings, "lock_request");
+	if (s->lock_request_seen >= 0 && lock_request != s->lock_request_seen)
+		lock_on_person_at_cross(s);
+	s->lock_request_seen = lock_request;
 	s->e_deadband.v[0] = (float)obs_data_get_double(settings, "e_deadband_x") * 1e-2;
 	s->e_deadband.v[1] = (float)obs_data_get_double(settings, "e_deadband_y") * 1e-2;
 	s->e_deadband.v[2] = (float)obs_data_get_double(settings, "e_deadband_z") * 1e-2;
@@ -214,6 +303,9 @@ static void ftptz_update(void *data, obs_data_t *settings)
 	s->face_lost_preset_timeout_ms = (int)(obs_data_get_double(settings, "face_lost_preset_timeout") * 1e3);
 	s->face_lost_ptz_preset = (int)obs_data_get_int(settings, "face_lost_ptz_preset");
 	s->face_lost_zoomout_timeout_ms = (int)(obs_data_get_double(settings, "face_lost_zoomout_timeout") * 1e3);
+
+	int track_fps = (int)obs_data_get_int(settings, "track_fps");
+	s->track_interval_ns = track_fps > 0 ? 1000000000ULL / (uint64_t)track_fps : 0;
 
 	s->debug_faces = obs_data_get_bool(settings, "debug_faces");
 	s->debug_notrack = obs_data_get_bool(settings, "debug_notrack");
@@ -272,12 +364,15 @@ static void emit_state_changed(struct face_tracker_ptz *);
 static void *ftptz_create(obs_data_t *settings, obs_source_t *context)
 {
 	auto *s = (struct face_tracker_ptz *)bzalloc(sizeof(struct face_tracker_ptz));
+	s->zone_gain[0] = s->zone_gain[1] = 1.0f;
 	s->ftm = new ft_manager_for_ftptz(s);
 	s->ftm->crop_cur.x1 = s->ftm->crop_cur.y1 = -2;
 	s->context = context;
 	s->ftm->scale = 2.0f;
 	s->hotkey_pause = OBS_INVALID_HOTKEY_PAIR_ID;
 	s->hotkey_reset = OBS_INVALID_HOTKEY_ID;
+	s->hotkey_lock = OBS_INVALID_HOTKEY_ID;
+	s->lock_request_seen = -1;
 
 	obs_source_update(context, settings);
 
@@ -300,6 +395,8 @@ static void ftptz_destroy(void *data)
 		obs_hotkey_pair_unregister(s->hotkey_pause);
 	if (s->hotkey_reset != OBS_INVALID_HOTKEY_ID)
 		obs_hotkey_unregister(s->hotkey_reset);
+	if (s->hotkey_lock != OBS_INVALID_HOTKEY_ID)
+		obs_hotkey_unregister(s->hotkey_lock);
 
 	delete s->ftm;
 	bfree(s->ptz_type);
@@ -317,6 +414,20 @@ static void ftptz_destroy(void *data)
 	bfree(s->scaler_buffer);
 
 	bfree(s);
+}
+
+// Operator: follow the person who is nearest to the yellow cross right now.
+static void lock_on_person_at_cross(struct face_tracker_ptz *s)
+{
+	const float x = (float)s->known_width * (0.5f + s->track_x);
+	const float y = (float)s->known_height * (0.5f - s->track_y);
+	s->ftm->presenter.request_lock(x, y);
+}
+
+static bool ftptz_lock_person(obs_properties_t *, obs_property_t *, void *data)
+{
+	lock_on_person_at_cross((struct face_tracker_ptz *)data);
+	return false;
 }
 
 static bool ftptz_reset_tracking(obs_properties_t *, obs_property_t *, void *data)
@@ -358,14 +469,221 @@ static bool ptz_type_modified(obs_properties_t *props, obs_property_t *, obs_dat
 	return true;
 }
 
+// Everyday settings are always shown; everything else appears only with "Show advanced settings".
+static bool show_advanced_modified(obs_properties_t *props, obs_property_t *, obs_data_t *settings)
+{
+	static const char *advanced[] = {
+		"preset_grp",
+		"facelost",
+		"g_numbers", // the numbers behind the named choices
+		"ftm",       // detector internals
+		"track",     // framing in the old units
+		"ctrl",      // control-loop internals
+		"invert_z",
+		"upsize_l",
+		"upsize_r",
+		"upsize_t",
+		"upsize_b",
+		"detector_dlib_hog_model",
+		"person_interval",
+		"e_deadband_x",
+		"e_deadband_y",
+		"Kp_x_db",
+		"Kp_y_db",
+		"detector_dlib_cnn_model",
+		"detector_upsample",
+		"detect_interval",
+		"landmark_detection",
+		"landmark_detection_data",
+		"tracking_th_en",
+		"tracking_th_dB",
+		"track_z",
+		"track_fps",
+		"e_nonlinear_x",
+		"e_nonlinear_y",
+		"Ki_x",
+		"Ki_y",
+		"Td_x",
+		"Td_y",
+		"Tdlpf",
+		"Kp_z_db",
+		"Ki_z",
+		"Td_z",
+		"Tdlpf_z",
+		"e_deadband_z",
+		"e_nonlinear_z",
+		"Tatt_int",
+		"invert_z",
+		NULL,
+	};
+	bool show = obs_data_get_bool(settings, "show_advanced");
+	for (int i = 0; advanced[i]; i++) {
+		obs_property_t *p = obs_properties_get(props, advanced[i]);
+		if (p)
+			obs_property_set_visible(p, show);
+	}
+	if (show) {
+		obs_property_t *p = obs_properties_get(props, "tracking_th_dB");
+		if (p)
+			obs_property_set_visible(p, obs_data_get_bool(settings, "tracking_th_en"));
+	}
+	return true;
+}
+
 static obs_properties_t *ftptz_properties(void *data)
 {
 	auto *s = (struct face_tracker_ptz *)data;
 	obs_properties_t *props;
 	props = obs_properties_create();
 
-	obs_properties_add_button(props, "ftptz_reset_tracking", obs_module_text("Reset tracking"),
+	obs_properties_add_button(props, "ftptz_lock_person",
+				  obs_module_text("LOCK on the person nearest the yellow cross"), ftptz_lock_person);
+	obs_properties_add_button(props, "ftptz_reset_tracking", obs_module_text("Release: stop following"),
 				  ftptz_reset_tracking);
+
+	// ---- 1. Who to follow
+	{
+		obs_properties_t *pp = obs_properties_create();
+		obs_property_t *p;
+		p = obs_properties_add_list(pp, "follow_mode", obs_module_text("Choosing the person"),
+					    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+		obs_property_list_add_string(p, obs_module_text("Automatic: the biggest person on stage"), "auto");
+		obs_property_list_add_string(p, obs_module_text("Manual: only the person I lock on"), "manual");
+		obs_property_set_long_description(
+			p,
+			obs_module_text("Manual: aim the camera so the person is on the yellow cross and press LOCK "
+					"(button above, hotkey, or the head's phone page). The camera stays with that "
+					"person. If they leave the picture it waits for them and never picks somebody "
+					"else by itself."));
+		p = obs_properties_add_list(pp, "lock_hold", obs_module_text("Automatic: if the person is lost"),
+					    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_FLOAT);
+		obs_property_list_add_float(p, obs_module_text("Wait 5 seconds, then follow somebody else"), 5.0);
+		obs_property_list_add_float(p, obs_module_text("Wait 10 seconds, then follow somebody else"), 10.0);
+		obs_property_list_add_float(p, obs_module_text("Wait 30 seconds, then follow somebody else"), 30.0);
+		obs_properties_add_group(
+			props, "g_who",
+			obs_module_text("1. Who to follow    (blue = people found, green = the one followed)"),
+			OBS_GROUP_NORMAL, pp);
+	}
+
+	// ---- 2. Framing
+	{
+		obs_properties_t *pp = obs_properties_create();
+		obs_property_t *p;
+		p = obs_properties_add_list(pp, "headroom", obs_module_text("Head room (space above the head)"),
+					    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+		obs_property_list_add_string(p, obs_module_text("Tight (closer shots)"), "tight");
+		obs_property_list_add_string(p, obs_module_text("Normal"), "normal");
+		obs_property_list_add_string(p, obs_module_text("Generous (wide shots)"), "generous");
+		obs_property_list_add_string(p, obs_module_text("Custom (number under Advanced)"), "custom");
+		p = obs_properties_add_list(pp, "lead", obs_module_text("Space in front of a walking person"),
+					    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+		obs_property_list_add_string(p, obs_module_text("None: always centred"), "off");
+		obs_property_list_add_string(p, obs_module_text("A little"), "some");
+		obs_property_list_add_string(p, obs_module_text("More"), "more");
+		obs_property_list_add_string(p, obs_module_text("Custom (number under Advanced)"), "custom");
+		obs_properties_add_group(props, "g_frame",
+					 obs_module_text("2. Framing    (yellow cross = where the head goes)"),
+					 OBS_GROUP_NORMAL, pp);
+	}
+
+	// ---- 3. Movement
+	{
+		obs_properties_t *pp = obs_properties_create();
+		obs_property_t *p;
+		p = obs_properties_add_list(pp, "sensitivity", obs_module_text("Sensitivity"), OBS_COMBO_TYPE_LIST,
+					    OBS_COMBO_FORMAT_STRING);
+		obs_property_list_add_string(p, obs_module_text("Low: calm camera, ignores small movements"), "low");
+		obs_property_list_add_string(p, obs_module_text("Medium"), "medium");
+		obs_property_list_add_string(p, obs_module_text("High: follows small movements too"), "high");
+		obs_property_list_add_string(p, obs_module_text("Custom (numbers under Advanced)"), "custom");
+		obs_property_set_long_description(
+			p,
+			obs_module_text("How far the person may move from the yellow cross before the camera follows. "
+					"The big yellow box on the preview shows it."));
+		p = obs_properties_add_list(pp, "zone_strength", obs_module_text("Speed"), OBS_COMBO_TYPE_LIST,
+					    OBS_COMBO_FORMAT_FLOAT);
+		obs_property_list_add_float(p, obs_module_text("Gentle: slow, smooth catching up"), 0.6);
+		obs_property_list_add_float(p, obs_module_text("Normal"), 1.0);
+		obs_property_list_add_float(p, obs_module_text("Firm: for people who move fast"), 1.6);
+		obs_property_set_long_description(
+			p, obs_module_text("How quickly the camera brings the person back. If a fast mover gets away, "
+					   "choose Firm and a higher Sensitivity."));
+		p = obs_properties_add_list(pp, "zone_anticipation", obs_module_text("When the person walks"),
+					    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_FLOAT);
+		obs_property_list_add_float(p, obs_module_text("Travel with them (like a camera operator)"), 1.0);
+		obs_property_list_add_float(p, obs_module_text("Travel with them, a little behind"), 0.6);
+		obs_property_list_add_float(p, obs_module_text("Only move once they are off-centre"), 0.0);
+		p = obs_properties_add_list(pp, "scope", obs_module_text("The camera may"), OBS_COMBO_TYPE_LIST,
+					    OBS_COMBO_FORMAT_STRING);
+		obs_property_list_add_string(p, obs_module_text("Turn and tilt"), "pt");
+		obs_property_list_add_string(p, obs_module_text("Turn only (tilt stays where the joystick left it)"),
+					     "pan");
+		p = obs_properties_add_list(pp, "pursuit_s", obs_module_text("If the person walks out of the picture"),
+					    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_FLOAT);
+		obs_property_list_add_float(p, obs_module_text("Stop and wait"), 0.0);
+		obs_property_list_add_float(p, obs_module_text("Keep turning that way for 2 seconds"), 2.0);
+		obs_property_list_add_float(p, obs_module_text("Keep turning that way for 4 seconds"), 4.0);
+		obs_properties_add_group(props, "g_move",
+					 obs_module_text("3. Movement    (big yellow box = where the camera rests)"),
+					 OBS_GROUP_NORMAL, pp);
+	}
+
+	// ---- 4. Search area
+	{
+		obs_properties_t *pp = obs_properties_create();
+		obs_property_t *p;
+		p = obs_properties_add_list(pp, "seats", obs_module_text("Seats in the bottom of the picture"),
+					    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+		obs_property_list_add_string(p, obs_module_text("None in view"), "none");
+		obs_property_list_add_string(p, obs_module_text("A few heads (ignore the bottom 15 %)"), "low");
+		obs_property_list_add_string(p, obs_module_text("Front rows (ignore the bottom 28 %)"), "medium");
+		obs_property_list_add_string(p, obs_module_text("Many rows (ignore the bottom 40 %)"), "high");
+		obs_property_list_add_string(p, obs_module_text("Custom (numbers under Advanced)"), "custom");
+		obs_property_set_long_description(
+			p, obs_module_text("People below the orange line are never followed. Set it so the orange box "
+					   "covers the stage and leaves out the congregation."));
+		obs_properties_add_group(
+			props, "g_search",
+			obs_module_text("4. Search area    (orange box = where people are looked for)"),
+			OBS_GROUP_NORMAL, pp);
+	}
+
+	// ---- Advanced: the numbers behind the choices above
+	{
+		obs_properties_t *pp = obs_properties_create();
+		obs_property_t *p;
+		p = obs_properties_add_float_slider(pp, "head_top_pct",
+						    obs_module_text("Head room = Custom: head this far from the top"),
+						    5.0, 60.0, 1.0);
+		obs_property_float_set_suffix(p, " % of the height");
+		p = obs_properties_add_float_slider(pp, "head_left_pct", obs_module_text("Head this far from the left"),
+						    20.0, 80.0, 1.0);
+		obs_property_float_set_suffix(p, " % of the width");
+		p = obs_properties_add_float_slider(pp, "lead_pct", obs_module_text("Space in front = Custom"), 0.0,
+						    15.0, 1.0);
+		obs_property_float_set_suffix(p, " % of the width");
+		p = obs_properties_add_float_slider(
+			pp, "zone_w_pct", obs_module_text("Sensitivity = Custom: rest zone width"), 4.0, 80.0, 1.0);
+		obs_property_float_set_suffix(p, " % of the width");
+		p = obs_properties_add_float_slider(
+			pp, "zone_h_pct", obs_module_text("Sensitivity = Custom: rest zone height"), 4.0, 80.0, 1.0);
+		obs_property_float_set_suffix(p, " % of the height");
+		p = obs_properties_add_float_slider(
+			pp, "search_b_pct", obs_module_text("Seats = Custom: ignore the bottom"), 0.0, 80.0, 1.0);
+		obs_property_float_set_suffix(p, " % of the height");
+		p = obs_properties_add_float_slider(pp, "search_t_pct", obs_module_text("Ignore the top"), 0.0, 80.0,
+						    1.0);
+		obs_property_float_set_suffix(p, " % of the height");
+		p = obs_properties_add_float_slider(pp, "search_l_pct", obs_module_text("Ignore the left side"), 0.0,
+						    80.0, 1.0);
+		obs_property_float_set_suffix(p, " % of the width");
+		p = obs_properties_add_float_slider(pp, "search_r_pct", obs_module_text("Ignore the right side"), 0.0,
+						    80.0, 1.0);
+		obs_property_float_set_suffix(p, " % of the width");
+		obs_properties_add_group(props, "g_numbers", obs_module_text("Advanced: exact numbers"),
+					 OBS_GROUP_NORMAL, pp);
+	}
 
 	{
 		obs_properties_t *pp = obs_properties_create();
@@ -387,43 +705,83 @@ static obs_properties_t *ftptz_properties(void *data)
 	{
 		obs_properties_t *pp = obs_properties_create();
 		face_tracker_manager::get_properties(pp);
-		obs_properties_add_group(props, "ftm", obs_module_text("Face detection options"), OBS_GROUP_NORMAL, pp);
-	}
-
-	{
-		obs_properties_t *pp = obs_properties_create();
-		obs_properties_add_float(pp, "track_z", obs_module_text("Zoom"), 0.1, 2.0, 0.05);
-		obs_properties_add_float(pp, "track_x", obs_module_text("X"), -1.0, +1.0, 0.05);
-		obs_properties_add_float(pp, "track_y", obs_module_text("Y"), -1.0, +1.0, 0.05);
-		obs_properties_add_group(props, "track", obs_module_text("Tracking target location"), OBS_GROUP_NORMAL,
-					 pp);
+		obs_properties_remove_by_name(pp, "follow_mode");
+		obs_properties_remove_by_name(pp, "lock_hold");
+		obs_properties_remove_by_name(pp, "person_model");
+		obs_properties_add_group(props, "ftm", obs_module_text("Advanced: detector"), OBS_GROUP_NORMAL, pp);
 	}
 
 	{
 		obs_properties_t *pp = obs_properties_create();
 		obs_property_t *p;
-		p = obs_properties_add_float(pp, "Kp_x_db", "Track Kp (X)", -40.0, +80.0, 1.0);
+		p = obs_properties_add_float_slider(pp, "track_y", obs_module_text("Head room: face higher or lower"),
+						    -0.5, +0.5, 0.01);
+		obs_property_set_long_description(
+			p,
+			obs_module_text("Where the face sits in the picture. 0 = middle. Higher numbers put the face "
+					"higher, leaving less space above the head. Typical: 0.15 to 0.35. "
+					"The yellow cross on the preview shows the spot."));
+		p = obs_properties_add_float_slider(pp, "track_x", obs_module_text("Face left or right"), -0.5, +0.5,
+						    0.01);
+		obs_property_set_long_description(p,
+						  obs_module_text("0 = centred. Negative = left, positive = right."));
+		obs_properties_add_float(pp, "track_z", obs_module_text("Zoom"), 0.1, 2.0, 0.05);
+		obs_property_t *p_fps =
+			obs_properties_add_int(pp, "track_fps", obs_module_text("Tracking rate limit"), 0, 60, 1);
+		obs_property_int_set_suffix(p_fps, " fps");
+		obs_property_set_long_description(
+			p_fps,
+			obs_module_text(
+				"How many frames per second are analyzed. Lower uses less CPU. 0 analyzes every frame."));
+		obs_properties_add_group(props, "track", obs_module_text("Advanced: old framing settings (not used)"),
+					 OBS_GROUP_NORMAL, pp);
+	}
+
+	{
+		obs_properties_t *pp = obs_properties_create();
+		obs_property_t *p;
+		p = obs_properties_add_float_slider(pp, "Kp_x_db", obs_module_text("Pan speed"), 20.0, 80.0, 1.0);
 		obs_property_float_set_suffix(p, " dB");
-		p = obs_properties_add_float(pp, "Kp_y_db", "Track Kp (Y)", -40.0, +80.0, 1.0);
+		obs_property_set_long_description(
+			p, obs_module_text("How hard the camera chases left and right. Too high: it swings past the "
+					   "person and comes back. Too low: it lags behind. Change 2 or 3 at a time."));
+		p = obs_properties_add_float_slider(pp, "Kp_y_db", obs_module_text("Tilt speed"), 20.0, 80.0, 1.0);
 		obs_property_float_set_suffix(p, " dB");
+		obs_property_set_long_description(
+			p, obs_module_text("Same for up and down. Usually 3 lower than pan speed."));
+		p = obs_properties_add_bool(
+			pp, "zone_mode", obs_module_text("Zone framing (off = the original continuous control below)"));
+		p = obs_properties_add_float_slider(pp, "e_deadband_x", obs_module_text("Still zone, left and right"),
+						    0.0, 20.0, 0.5);
+		obs_property_float_set_suffix(p, " %");
+		obs_property_set_long_description(
+			p,
+			obs_module_text("The camera stays still while the face is inside the yellow box. Bigger = "
+					"calmer camera, but the person can sit further off-centre. Typical: 1 to 4."));
+		p = obs_properties_add_float_slider(pp, "e_deadband_y", obs_module_text("Still zone, up and down"), 0.0,
+						    20.0, 0.5);
+		obs_property_float_set_suffix(p, " %");
+		obs_property_set_long_description(
+			p, obs_module_text("Bigger stops the camera bobbing when the person nods. Typical: 3 to 8."));
+		p = obs_properties_add_float(pp, "e_nonlinear_x",
+					     obs_module_text("Soft edge of still zone, left and right"), 0.0, 50, 0.1);
+		p = obs_properties_add_float(pp, "e_nonlinear_y",
+					     obs_module_text("Soft edge of still zone, up and down"), 0.0, 50, 0.1);
+		obs_properties_add_float(pp, "Ki_x", obs_module_text("Pan follow-through (Ki)"), 0.0, 5.0, 0.01);
+		obs_properties_add_float(pp, "Ki_y", obs_module_text("Tilt follow-through (Ki)"), 0.0, 5.0, 0.01);
+		obs_properties_add_float(pp, "Td_x", obs_module_text("Pan quick start (Td)"), 0.0, 5.0, 0.01);
+		obs_properties_add_float(pp, "Td_y", obs_module_text("Tilt quick start (Td)"), 0.0, 5.0, 0.01);
+		obs_properties_add_float(pp, "Tdlpf", obs_module_text("Smoothing"), 0.0, 10.0, 0.1);
 		p = obs_properties_add_float(pp, "Kp_z_db", "Track Kp (Z)", -40.0, +60.0, 1.0);
 		obs_property_float_set_suffix(p, " dB");
-		obs_properties_add_float(pp, "Ki_x", "Track Ki (X)", 0.0, 5.0, 0.01);
-		obs_properties_add_float(pp, "Ki_y", "Track Ki (Y)", 0.0, 5.0, 0.01);
 		obs_properties_add_float(pp, "Ki_z", "Track Ki (Z)", 0.0, 5.0, 0.01);
-		obs_properties_add_float(pp, "Td_x", "Track Td (X)", 0.0, 5.0, 0.01);
-		obs_properties_add_float(pp, "Td_y", "Track Td (Y)", 0.0, 5.0, 0.01);
 		obs_properties_add_float(pp, "Td_z", "Track Td (Z)", 0.0, 5.0, 0.01);
-		obs_properties_add_float(pp, "Tdlpf", "Track LPF for Td (X, Y)", 0.0, 10.0, 0.1);
 		obs_properties_add_float(pp, "Tdlpf_z", "Track LPF for Td (Z)", 0.0, 10.0, 0.1);
-		obs_properties_add_float(pp, "e_deadband_x", "Dead band (X)", 0.0, 50, 0.1);
-		obs_properties_add_float(pp, "e_deadband_y", "Dead band (Y)", 0.0, 50, 0.1);
 		obs_properties_add_float(pp, "e_deadband_z", "Dead band (Z)", 0.0, 50, 0.1);
-		obs_properties_add_float(pp, "e_nonlinear_x", "Nonlinear band (X)", 0.0, 50, 0.1);
-		obs_properties_add_float(pp, "e_nonlinear_y", "Nonlinear band (Y)", 0.0, 50, 0.1);
 		obs_properties_add_float(pp, "e_nonlinear_z", "Nonlinear band (Z)", 0.0, 50, 0.1);
 		obs_properties_add_float(pp, "Tatt_int", "Attenuation time for lost face", 0.0, 4.0, 0.5);
-		obs_properties_add_group(props, "ctrl", obs_module_text("Tracking response"), OBS_GROUP_NORMAL, pp);
+		obs_properties_add_group(props, "ctrl", obs_module_text("Advanced: control loop"), OBS_GROUP_NORMAL,
+					 pp);
 	}
 
 	{
@@ -441,7 +799,7 @@ static obs_properties_t *ftptz_properties(void *data)
 
 	{
 		obs_properties_t *pp = obs_properties_create();
-		obs_property_t *p = obs_properties_add_list(pp, "ptz-type", obs_module_text("PTZ Type"),
+		obs_property_t *p = obs_properties_add_list(pp, "ptz-type", obs_module_text("Connection type"),
 							    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 		obs_property_list_add_string(p, obs_module_text("None"), "dummy");
 		obs_property_list_add_string(p, obs_module_text("through PTZ Controls"), "obsptz");
@@ -450,16 +808,34 @@ static obs_properties_t *ftptz_properties(void *data)
 #endif // WITH_PTZ_TCP
 		obs_property_set_modified_callback(p, ptz_type_modified);
 
-		obs_properties_add_bool(pp, "invert_x", obs_module_text("Invert control (Pan)"));
-		obs_properties_add_bool(pp, "invert_y", obs_module_text("Invert control (Tilt)"));
+		obs_properties_add_bool(pp, "invert_x",
+					obs_module_text("Camera turns the wrong way left / right: reverse"));
+		obs_properties_add_bool(pp, "invert_y",
+					obs_module_text("Camera turns the wrong way up / down: reverse"));
 		obs_properties_add_bool(pp, "invert_z", obs_module_text("Invert control (Zoom)"));
-		obs_properties_add_group(props, "output", obs_module_text("Output"), OBS_GROUP_NORMAL, pp);
+		obs_properties_add_group(
+			props, "output",
+			obs_module_text("5. Connection to the head    (address x70head.local, port 5678)"),
+			OBS_GROUP_NORMAL, pp);
 	}
 
 	{
 		obs_properties_t *pp = obs_properties_create();
-		obs_properties_add_bool(pp, "debug_faces", "Show face detection results");
-		obs_properties_add_bool(pp, "debug_always_show", "Always show information (useful for demo)");
+		obs_property_t *pm = obs_properties_add_list(pp, "person_model", obs_module_text("Detection quality"),
+							     OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+		obs_property_list_add_string(pm, obs_module_text("Accurate (default)"), "tiny");
+		obs_property_list_add_string(pm, obs_module_text("Fast (use if OBS reports overload)"), "nano");
+		obs_property_t *po = obs_properties_add_bool(
+			pp, "pose", obs_module_text("Find the head from the body pose (yellow stick figure)"));
+		obs_property_set_long_description(
+			po,
+			obs_module_text("Finds the head, shoulders, arms and legs of the person being followed. The "
+					"camera then frames the real head, so a raised arm or a lean does not move "
+					"the shot, and leaves a little room on the side the person is facing. Costs "
+					"about 10 ms per look. Turn off only if OBS reports overload."));
+		obs_properties_add_bool(pp, "debug_faces", "Show the coloured boxes in this window");
+		obs_properties_add_bool(pp, "debug_always_show",
+					"Show them on the main OBS preview too (they are never recorded or streamed)");
 #ifdef ENABLE_DEBUG_DATA
 		obs_properties_add_path(pp, "debug_data_tracker", "Save correlation tracker data to file",
 					OBS_PATH_FILE_SAVE, DEBUG_DATA_PATH_FILTER, NULL);
@@ -468,7 +844,18 @@ static obs_properties_t *ftptz_properties(void *data)
 		obs_properties_add_path(pp, "debug_data_control", "Save control data to file", OBS_PATH_FILE_SAVE,
 					DEBUG_DATA_PATH_FILTER, NULL);
 #endif
-		obs_properties_add_group(props, "debug", obs_module_text("Debugging"), OBS_GROUP_NORMAL, pp);
+		obs_properties_add_group(props, "debug", obs_module_text("6. Performance and preview"),
+					 OBS_GROUP_NORMAL, pp);
+	}
+
+	obs_property_t *p_adv =
+		obs_properties_add_bool(props, "show_advanced", obs_module_text("Show advanced settings"));
+	obs_property_set_modified_callback(p_adv, show_advanced_modified);
+
+	obs_data_t *cur = obs_source_get_settings(s->context);
+	if (cur) {
+		show_advanced_modified(props, NULL, cur);
+		obs_data_release(cur);
 	}
 
 	return props;
@@ -480,22 +867,58 @@ static void ftptz_get_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "preset_mask_control", true);
 	face_tracker_manager::get_defaults(settings);
 	obs_data_set_default_double(settings, "tracking_th_dB",
-				    -40.0);                      // overwrite the default from face_tracker_manager
-	obs_data_set_default_double(settings, "track_z", 0.25);  // Smaller is preferable for PTZ not to lose the face.
-	obs_data_set_default_double(settings, "track_y", +0.00); // +0.00 +0.10 +0.30
+				    -40.0); // overwrite the default from face_tracker_manager
+	// Defaults of this fork: the X70 pan/tilt head (x70head.local), a 1080p camera about 20 m from the stage,
+	// full-body framing, OBS at 30 fps and the head's tracking speed scale at 0.2.
+	obs_data_set_default_int(settings, "track_fps", 12);
+	obs_data_set_default_double(settings, "scale", 1.0);
+	obs_data_set_default_double(settings, "lock_hold", 10.0);
+	obs_data_set_default_int(settings, "detector_crop_b", 300);
+	obs_data_set_default_double(settings, "track_z", 0.25);
+	obs_data_set_default_double(settings, "track_y", 0.25);
 
-	obs_data_set_default_double(settings, "Kp_x_db", 50.0);
-	obs_data_set_default_double(settings, "Kp_y_db", 50.0);
-	obs_data_set_default_double(settings, "Kp_z_db", 40.0);
-	obs_data_set_default_double(settings, "Ki_x", 0.3);
-	obs_data_set_default_double(settings, "Ki_y", 0.3);
-	obs_data_set_default_double(settings, "Ki_z", 0.1);
-	obs_data_set_default_double(settings, "Td_x", 0.42);
-	obs_data_set_default_double(settings, "Td_y", 0.42);
-	obs_data_set_default_double(settings, "Td_z", 0.14);
+	obs_data_set_default_double(settings, "Kp_x_db", 62.0);
+	obs_data_set_default_double(settings, "Kp_y_db", 59.0);
+	obs_data_set_default_double(settings, "Kp_z_db", -40.0);
+	obs_data_set_default_double(settings, "Ki_x", 0.2);
+	obs_data_set_default_double(settings, "Ki_y", 0.2);
+	obs_data_set_default_double(settings, "Ki_z", 0.0);
+	obs_data_set_default_double(settings, "Td_x", 0.25);
+	obs_data_set_default_double(settings, "Td_y", 0.25);
+	obs_data_set_default_double(settings, "Td_z", 0.0);
 	obs_data_set_default_double(settings, "Tdlpf", 2.0);
 	obs_data_set_default_double(settings, "Tdlpf_z", 6.0);
 	obs_data_set_default_double(settings, "Tatt_int", 2.0);
+	obs_data_set_default_bool(settings, "zone_mode", true);
+	obs_data_set_default_double(settings, "head_top_pct", 25.0);
+	obs_data_set_default_double(settings, "head_left_pct", 50.0);
+	obs_data_set_default_double(settings, "zone_w_pct", 20.0);
+	obs_data_set_default_double(settings, "zone_h_pct", 20.0);
+	obs_data_set_default_double(settings, "search_l_pct", 0.0);
+	obs_data_set_default_double(settings, "search_r_pct", 0.0);
+	obs_data_set_default_double(settings, "search_t_pct", 0.0);
+	obs_data_set_default_double(settings, "search_b_pct", 28.0);
+	obs_data_set_default_double(settings, "pursuit_s", 2.0);
+	obs_data_set_default_double(settings, "lead_pct", 5.0);
+	obs_data_set_default_string(settings, "headroom", "normal");
+	obs_data_set_default_string(settings, "lead", "some");
+	obs_data_set_default_string(settings, "sensitivity", "medium");
+	obs_data_set_default_string(settings, "seats", "medium");
+	obs_data_set_default_string(settings, "scope", "pt");
+	obs_data_set_default_double(settings, "zone_x", 10.0);
+	obs_data_set_default_double(settings, "zone_y", 10.0);
+	obs_data_set_default_double(settings, "zone_anticipation", 1.0);
+	obs_data_set_default_double(settings, "zone_strength", 1.0);
+	obs_data_set_default_int(settings, "lock_request", 0);
+	if (face_tracker_manager::person_engine_available()) {
+		obs_data_set_default_int(settings, "detector_engine", (int)face_tracker_manager::engine_person);
+		obs_data_set_default_double(settings, "scale", 2.0); // a whole person is big: half size is plenty
+	}
+	obs_data_set_default_double(settings, "e_deadband_x", 2.0);
+	obs_data_set_default_double(settings, "e_nonlinear_x", 4.0);
+	obs_data_set_default_double(settings, "e_deadband_y", 4.0);
+	obs_data_set_default_double(settings, "e_nonlinear_y", 6.0);
+	obs_data_set_default_double(settings, "e_deadband_z", 50.0);
 
 	obs_data_set_default_double(settings, "face_lost_preset_timeout", 5.0);
 	obs_data_set_default_int(settings, "face_lost_ptz_preset", -1);
@@ -505,8 +928,9 @@ static void ftptz_get_defaults(obs_data_t *settings)
 	obs_data_set_default_obj(settings, "presets", presets);
 	obs_data_release(presets);
 
-	obs_data_set_default_string(settings, "ptz-type", "obsptz");
-	obs_data_set_default_int(settings, "ptz.visca-over-tcp.port", 1259);
+	obs_data_set_default_string(settings, "ptz-type", "visca-over-tcp");
+	obs_data_set_default_string(settings, "ptz.visca-over-tcp.address", "x70head.local");
+	obs_data_set_default_int(settings, "ptz.visca-over-tcp.port", 5678);
 	obs_data_set_default_int(settings, "ptz.obsptz.max_x", PTZ_MAX_X);
 	obs_data_set_default_int(settings, "ptz.obsptz.max_y", PTZ_MAX_Y);
 	obs_data_set_default_int(settings, "ptz.obsptz.max_z", PTZ_MAX_Z);
@@ -659,10 +1083,24 @@ static void hotkey_cb_reset(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, 
 		ftptz_reset_tracking(NULL, NULL, data);
 }
 
+static void hotkey_cb_lock(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
+{
+	UNUSED_PARAMETER(id);
+	UNUSED_PARAMETER(hotkey);
+	if (pressed)
+		lock_on_person_at_cross((struct face_tracker_ptz *)data);
+}
+
 static void register_hotkeys(struct face_tracker_ptz *s, obs_source_t *target)
 {
 	if (!target)
 		return;
+
+	if (s->hotkey_lock == OBS_INVALID_HOTKEY_ID) {
+		s->hotkey_lock = obs_hotkey_register_source(
+			target, "face-tracker.lock",
+			obs_module_text("Face Tracker PTZ: lock on the person at the cross"), hotkey_cb_lock, s);
+	}
 
 	if (s->hotkey_pause == OBS_INVALID_HOTKEY_PAIR_ID) {
 		s->hotkey_pause = obs_hotkey_pair_register_source(target, "face-tracker.pause",
@@ -682,10 +1120,183 @@ static void tick_filter(struct face_tracker_ptz *s, float second)
 {
 	const float srwh = sqrtf((float)s->known_width * s->known_height);
 
+	if (s->known_width > 0 && s->known_height > 0) {
+		// The search area is set as a share of the picture, so it means the same at any resolution.
+		s->ftm->detector_crop_l = (int)(s->search_pct[0] * 0.01f * (float)s->known_width);
+		s->ftm->detector_crop_r = (int)(s->search_pct[1] * 0.01f * (float)s->known_width);
+		s->ftm->detector_crop_t = (int)(s->search_pct[2] * 0.01f * (float)s->known_height);
+		s->ftm->detector_crop_b = (int)(s->search_pct[3] * 0.01f * (float)s->known_height);
+		// A whole person is large in the picture: analysing at about 960 pixels wide is plenty and saves CPU.
+		if (s->ftm->detector_engine == face_tracker_manager::engine_person)
+			s->ftm->scale = std::max(1.0f, roundf((float)s->known_width / 960.0f));
+	}
+
 	f3 e = s->detect_err;
 	f3 e_int = e;
+
+	// One line a minute in the OBS log, for tuning after a service (see tools/x70_report.py).
+	if (s->zone_mode && s->known_width > 0) {
+		auto &st = s->stats;
+		const float w = (float)s->known_width;
+		st.t += second;
+		if (s->face_found) {
+			st.t_seen += second;
+			const float off = std::abs(e.v[0]) / w;
+			st.off_sum += off * second;
+			st.off_max = std::max(st.off_max, off);
+			st.v_max = std::max(st.v_max, std::abs(s->zone_v[0]) / w);
+			st.gone = 0.0f;
+			if (s->ftm->pose_known)
+				st.t_pose += second;
+		} else {
+			if (s->face_found_last) {
+				st.lost++;
+				if (std::abs(s->zone_last_x[0]) > 0.3f * w)
+					st.lost_edge++;
+				if (std::abs(s->zone_v[0]) > 0.06f * w)
+					st.lost_fast++;
+			}
+			st.gone += second;
+			st.gone_max = std::max(st.gone_max, st.gone);
+		}
+		if (s->zone_moving[0] || s->zone_moving[1])
+			st.t_moving += second;
+		st.cmd_max = std::max(st.cmd_max, std::abs(s->zone_cmd[0]) / w);
+		if (s->zone_pursuit_left > 0.0f && s->zone_pursuit_left >= s->pursuit_s - second * 1.5f)
+			st.chased++;
+#ifdef WITH_NCNN
+		st.people_max = std::max(st.people_max, s->ftm->presenter.people());
+#endif
+		if (st.t >= 60.0f) {
+			if (st.t_seen > 0.0f || st.lost > 0)
+				blog(LOG_INFO,
+				     "X70-STATS secs=%.0f seen=%.0f%% lost=%d lost_edge=%d lost_fast=%d gone_max=%.1f "
+				     "chased=%d off_avg=%.1f%% off_max=%.0f%% v_max=%.0f%%/s moving=%.0f%% cmd_max=%.0f%% "
+				     "people_max=%d pose=%.0f%% gain_pan=%.2f gain_tilt=%.2f cam_measured=%d zone=%.0f%% "
+				     "strength=%.1f antic=%.1f pursuit=%.0f lead=%.0f%%",
+				     st.t, 100.0f * st.t_seen / st.t, st.lost, st.lost_edge, st.lost_fast, st.gone_max,
+				     st.chased, st.t_seen > 0 ? 100.0f * st.off_sum / st.t_seen : 0.0f,
+				     100.0f * st.off_max, 100.0f * st.v_max, 100.0f * st.t_moving / st.t,
+				     100.0f * st.cmd_max, st.people_max,
+				     st.t_seen > 0 ? 100.0f * st.t_pose / st.t_seen : 0.0f, s->zone_gain[0],
+				     s->zone_gain[1], (int)s->ftm->camera_speed_known, 200.0f * s->zone_x,
+				     s->zone_strength, s->zone_anticipation, s->pursuit_s, 100.0f * s->lead_frac);
+			const float gone = st.gone;
+			st = face_tracker_ptz::stats_s();
+			st.gone = gone;
+		}
+	}
 	for (int i = 0; i < 3; i++) {
 		float x = e.v[i];
+		if (s->zone_mode && i < 2) {
+			// Zone framing, the way a camera operator works:
+			//  - small movements near the middle are ignored (rest zone);
+			//  - when the person walks, the camera starts moving WITH them, at their speed, without waiting
+			//    for them to reach the edge of the zone;
+			//  - when they stop, the camera eases them back to the middle and rests.
+			const float size = i == 0 ? (float)s->known_width : (float)s->known_height;
+			const float outer = (i == 0 ? s->zone_x : s->zone_y) * size;
+			const float inner = outer * 0.3f;
+			const float K = 1.0f; // 1/s: how a calibrated head answers with the speed settings as designed
+			// The person's own speed is what the detector sees plus what the camera's movement takes away.
+			// The camera's movement is measured from the background sliding across the picture. If that
+			// cannot be measured (a plain wall), it is estimated from what was asked of the head.
+			const float v_seen = i == 0 ? s->ftm->presenter_vx : s->ftm->presenter_vy;
+			const bool measured = s->ftm->camera_speed_known;
+			s->zone_rate[i] += (K * s->zone_gain[i] * s->zone_cmd[i] - s->zone_rate[i]) *
+					   std::min(1.0f, second / 0.2f);
+			const float v_camera = measured ? (i == 0 ? s->ftm->camera_vx : s->ftm->camera_vy)
+							: s->zone_rate[i];
+			s->zone_v[i] += (v_seen + v_camera - s->zone_v[i]) * std::min(1.0f, second / 0.25f);
+			if (s->ftm->detector_engine != face_tracker_manager::engine_person)
+				s->zone_v[i] = 0.0f; // the face detectors give no speed: plain zone framing
+
+			// Learn how strongly the head really answers. The speed settings assume a calibrated head; if
+			// it turns out faster or slower, the commands are scaled so the camera still behaves the same.
+			s->zone_cmd_lag[i] += (s->zone_cmd[i] - s->zone_cmd_lag[i]) * std::min(1.0f, second / 0.45f);
+			if (measured && std::abs(s->zone_cmd_lag[i]) > 0.03f * size &&
+			    std::abs(v_camera) > 0.02f * size) {
+				float g = v_camera / (K * s->zone_cmd_lag[i]);
+				g = std::max(0.2f, std::min(5.0f, g));
+				s->zone_gain[i] += (g - s->zone_gain[i]) * std::min(1.0f, second / 1.5f);
+			}
+
+			const float v_walk = 0.06f * size, v_still = 0.02f * size;
+
+			// Lead room: a walking person is framed a little behind the middle, so there is space in front
+			// of them, the way an operator frames a walk. It eases in as they walk and out when they stop.
+			if (i == 0) {
+				float want = 0.0f;
+				if (s->face_found) {
+					want = s->lead_frac * size *
+					       std::max(-1.0f, std::min(1.0f, s->zone_v[0] / (0.15f * size)));
+					// Looking room: standing but turned to one side, a little space is left on the
+					// side the person faces (known from the body pose).
+					const float f = s->ftm->presenter_facing;
+					if (std::abs(s->zone_v[0]) < v_still && std::abs(f) > 0.4f)
+						want = 0.6f * s->lead_frac * size * (f > 0 ? 1.0f : -1.0f) *
+						       (std::abs(f) - 0.4f) / 0.6f;
+				}
+				s->zone_lead += (want - s->zone_lead) * std::min(1.0f, second / 0.8f);
+				x += s->zone_lead;
+			}
+			if (std::abs(s->zone_v[i]) > v_walk)
+				s->zone_fast_s[i] += second;
+			else
+				s->zone_fast_s[i] = 0.0f;
+
+			if (!s->face_found) {
+				// Just lost. If the person was walking out of the side of the picture, keep turning that
+				// way for a moment: they are most likely just beyond the edge.
+				if (i == 0 && s->face_found_last && s->zone_moving[0] && s->pursuit_s > 0.0f &&
+				    std::abs(s->zone_last_x[0]) > 0.25f * size && std::abs(s->zone_v[0]) > v_walk &&
+				    s->zone_last_x[0] * s->zone_v[0] > 0.0f &&
+				    s->zone_last_x[0] * s->zone_cmd[0] > 0.0f) {
+					s->zone_pursuit_left = s->pursuit_s;
+					s->zone_pursuit_cmd = s->zone_cmd[0];
+					blog(LOG_INFO,
+					     "presenter walked out of the picture: turning after them for %.1f s",
+					     s->pursuit_s);
+				}
+				s->zone_moving[i] = false;
+				s->zone_v[i] = 0.0f;
+				s->zone_fast_s[i] = 0.0f;
+			} else if (!s->zone_moving[i] && (std::abs(x) > outer || s->zone_fast_s[i] > 0.3f)) {
+				s->zone_moving[i] = true;
+			} else if (s->zone_moving[i] && std::abs(x) < inner && std::abs(s->zone_v[i]) < v_still) {
+				s->zone_moving[i] = false;
+			}
+
+			float cmd = 0.0f;
+			if (s->face_found) {
+				s->zone_last_x[i] = x;
+				if (i == 0)
+					s->zone_pursuit_left = 0.0f;
+			} else if (i == 0 && s->zone_pursuit_left > 0.0f) {
+				s->zone_pursuit_left -= second;
+				cmd = s->zone_pursuit_cmd;
+			}
+			if (s->zone_moving[i]) {
+				// position: bring the person to the middle. speed: travel with them. Without a measured
+				// camera speed the second part is only an estimate, so it is used at half strength.
+				const float ff = s->zone_anticipation * (measured ? 1.0f : 0.5f);
+				// How firmly to pull the person back: the chosen strength, and firmer still when they are
+				// far from the middle and about to leave the picture.
+				float pull = s->zone_strength;
+				if (std::abs(x) > 0.3f * size)
+					pull *= 1.6f;
+				cmd = (pull * x + ff * s->zone_v[i]) / (K * s->zone_gain[i]);
+				const float cmd_max = 0.6f * size;
+				cmd = std::max(-cmd_max, std::min(cmd_max, cmd));
+			}
+			if (i == 1 && s->pan_only)
+				cmd = 0.0f; // tilt stays where the operator left it
+			s->zone_cmd[i] = cmd;
+			s->filter_int.v[i] = 0.0f;
+			e_int.v[i] = 0.0f;
+			e.v[i] = 0.0f;
+			continue;
+		}
 		float d = srwh * s->e_deadband.v[i];
 		float n = srwh * s->e_nonlinear.v[i];
 		if (std::abs(x) <= d)
@@ -727,6 +1338,19 @@ static void tick_filter(struct face_tracker_ptz *s, float second)
 		for (int i = 0; i < 3; i++)
 			uf.v[i] = (e.v[i] + s->filter_int.v[i]) * second +
 				  (s->filter_lpf.v[i] - filter_lpf_prev.v[i]) * s->klpf.v[i];
+	}
+	if (s->zone_mode) {
+		for (int i = 0; i < 2; i++)
+			uf.v[i] = s->zone_cmd[i] * second; // zero when nobody is followed, except while pursuing
+		const uint64_t now_ns = os_gettime_ns();
+		if (now_ns - s->zone_gain_log_ns > 60000000000ULL &&
+		    (std::abs(s->zone_gain[0] - 1.0f) > 0.25f || std::abs(s->zone_gain[1] - 1.0f) > 0.25f)) {
+			s->zone_gain_log_ns = now_ns;
+			blog(LOG_INFO,
+			     "camera response measured: pan %.2f, tilt %.2f of what the speed settings assume "
+			     "(1.00 = calibrated; commands are adjusted to match)",
+			     s->zone_gain[0], s->zone_gain[1]);
+		}
 	}
 	s->face_found_last = s->face_found;
 	const float kp_zoom = std::max(s->ptz_query[2], 1.0f);
@@ -1012,6 +1636,31 @@ static struct obs_source_frame *ftptz_filter_video(void *data, struct obs_source
 
 	auto *s = (struct face_tracker_ptz *)data;
 
+	s->known_width = frame->width;
+	s->known_height = frame->height;
+	s->rendered = true;
+
+	// Analyzing every video frame is the main CPU cost of this filter and a pan/tilt head cannot use
+	// position updates that fast. Skip all per-frame work (scaling, copying, tracking) until the next
+	// analysis is due. The control loop keeps running every tick on the latest tracking result.
+	if (s->track_interval_ns) {
+		uint64_t now = os_gettime_ns();
+		if (now - s->last_stage_ns < s->track_interval_ns - s->track_interval_ns / 8)
+			return frame;
+		s->last_stage_ns = now;
+	}
+
+	const float diag_scale = s->ftm->scale * (s->ftm->detector_upsample ? 0.5f : 1.0f);
+	if (frame->width != s->diag_width || frame->height != s->diag_height || diag_scale != s->diag_scale) {
+		s->diag_width = frame->width;
+		s->diag_height = frame->height;
+		s->diag_scale = diag_scale;
+		// trackers started on the old picture size cannot continue on the new one
+		s->ftm->reset_requested = true;
+		blog(LOG_INFO, "analysing %ux%u video (format %d) at scale %.1f: faces must be at least %d px tall",
+		     frame->width, frame->height, (int)frame->format, s->ftm->scale, (int)(80 * diag_scale));
+	}
+
 	std::shared_ptr<texture_object> cvtex(new texture_object());
 	cvtex->scale = s->ftm->scale;
 	cvtex->tick = s->ftm->tick_cnt;
@@ -1037,6 +1686,17 @@ static struct obs_source_frame *ftptz_filter_video(void *data, struct obs_source
 	return frame;
 }
 
+static void draw_box(float x0, float y0, float x1, float y1)
+{
+	gs_render_start(false);
+	gs_vertex2f(x0, y0);
+	gs_vertex2f(x1, y0);
+	gs_vertex2f(x1, y1);
+	gs_vertex2f(x0, y1);
+	gs_vertex2f(x0, y0);
+	gs_render_stop(GS_LINESTRIP);
+}
+
 static void draw_frame_info(struct face_tracker_ptz *s, bool landmark_only = false)
 {
 	bool draw_det = !landmark_only;
@@ -1047,9 +1707,16 @@ static void draw_frame_info(struct face_tracker_ptz *s, bool landmark_only = fal
 	while (gs_effect_loop(effect, "Solid")) {
 		if (draw_det) {
 			gs_effect_set_color(gs_effect_get_param_by_name(effect, "color"), 0xFF0000FF);
-			for (size_t i = 0; i < s->ftm->detect_rects.size(); i++)
-				draw_rect_upsize(s->ftm->detect_rects[i], s->ftm->upsize_l, s->ftm->upsize_r,
-						 s->ftm->upsize_t, s->ftm->upsize_b);
+			const bool person = s->ftm->detector_engine == face_tracker_manager::engine_person;
+			for (size_t i = 0; i < s->ftm->detect_rects.size(); i++) {
+				if (person && s->ftm->detect_rects[i].score < 0.3f)
+					continue;
+				if (person)
+					draw_rect_upsize(s->ftm->detect_rects[i]);
+				else
+					draw_rect_upsize(s->ftm->detect_rects[i], s->ftm->upsize_l, s->ftm->upsize_r,
+							 s->ftm->upsize_t, s->ftm->upsize_b);
+			}
 		}
 
 		gs_effect_set_color(gs_effect_get_param_by_name(effect, "color"), 0xFF00FF00);
@@ -1061,6 +1728,26 @@ static void draw_frame_info(struct face_tracker_ptz *s, bool landmark_only = fal
 				draw_landmark(tr.landmark);
 		}
 
+#ifdef WITH_NCNN
+		// Body pose of the person being followed: a yellow stick figure.
+		float kp[PT_KP][3];
+		if (draw_trk && s->ftm->detector_engine == face_tracker_manager::engine_person && s->ftm->pose_on &&
+		    s->ftm->presenter.pose((double)os_gettime_ns() * 1e-9, kp)) {
+			static const int bone[][2] = {{5, 6},  {5, 7},   {7, 9},   {6, 8},   {8, 10},  {5, 11},
+						      {6, 12}, {11, 12}, {11, 13}, {13, 15}, {12, 14}, {14, 16},
+						      {0, 1},  {0, 2},   {1, 3},   {2, 4}};
+			gs_effect_set_color(gs_effect_get_param_by_name(effect, "color"), 0xFF00FFFF);
+			for (size_t b = 0; b < sizeof(bone) / sizeof(bone[0]); b++) {
+				const float *a = kp[bone[b][0]], *c = kp[bone[b][1]];
+				if (a[2] < 0.35f || c[2] < 0.35f)
+					continue;
+				gs_render_start(false);
+				gs_vertex2f(a[0], a[1]);
+				gs_vertex2f(c[0], c[1]);
+				gs_render_stop(GS_LINES);
+			}
+		}
+#endif
 		if (draw_ref) {
 			gs_effect_set_color(gs_effect_get_param_by_name(effect, "color"), 0xFFFFFF00); // amber
 			gs_render_start(false);
@@ -1072,6 +1759,32 @@ static void draw_frame_info(struct face_tracker_ptz *s, bool landmark_only = fal
 			gs_vertex2f(rcx, rcy - srwhr2 * s->track_z);
 			gs_vertex2f(rcx, rcy + srwhr2 * s->track_z);
 			gs_render_stop(GS_LINES);
+
+			// Still zone (yellow box): the camera does not move while the middle of the face is inside it.
+			float still_x = srwhr2 * 2.0f * s->e_deadband.v[0];
+			float still_y = srwhr2 * 2.0f * s->e_deadband.v[1];
+			if (s->zone_mode) {
+				// Rest zone (big yellow box) and settle zone (small one): the camera starts moving when the
+				// head leaves the big box and stops once it is back inside the small one.
+				still_x = s->zone_x * (float)s->known_width;
+				still_y = s->zone_y * (float)s->known_height;
+				draw_box(rcx - still_x * 0.3f, rcy - still_y * 0.3f, rcx + still_x * 0.3f,
+					 rcy + still_y * 0.3f);
+			}
+			if (still_x > 0.0f && still_y > 0.0f)
+				draw_box(rcx - still_x, rcy - still_y, rcx + still_x, rcy + still_y);
+
+			// Search area (orange box, drawn double): faces are only looked for inside it.
+			gs_effect_set_color(gs_effect_get_param_by_name(effect, "color"), 0xFFFF8800);
+			const float sx0 = (float)s->ftm->detector_crop_l;
+			const float sy0 = (float)s->ftm->detector_crop_t;
+			const float sx1 = (float)s->known_width - (float)s->ftm->detector_crop_r;
+			const float sy1 = (float)s->known_height - (float)s->ftm->detector_crop_b;
+			if (sx1 - sx0 > 8.0f && sy1 - sy0 > 8.0f) {
+				draw_box(sx0 + 1.0f, sy0 + 1.0f, sx1 - 1.0f, sy1 - 1.0f);
+				draw_box(sx0 + 4.0f, sy0 + 4.0f, sx1 - 4.0f, sy1 - 4.0f);
+			}
+			gs_effect_set_color(gs_effect_get_param_by_name(effect, "color"), 0xFFFFFF00);
 
 			if (s->ftm->landmark_detection_data) {
 				gs_render_start(false);

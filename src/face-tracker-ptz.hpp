@@ -10,6 +10,10 @@ struct face_tracker_ptz
 	uint32_t known_width;
 	uint32_t known_height;
 	bool rendered;
+	uint64_t track_interval_ns; // minimum time between frames handed to the detector/trackers; 0 = every frame
+	uint64_t last_stage_ns;
+	uint32_t diag_width, diag_height;
+	float diag_scale;
 	bool is_active;
 
 	video_scaler_t *scaler;
@@ -29,6 +33,19 @@ struct face_tracker_ptz
 	f3 klpf;
 	f3 tlpf;
 	f3 e_deadband, e_nonlinear; // deadband and nonlinear amount for error input
+	// Zone framing: the camera rests while the presenter is inside the rest zone around the target point. When
+	// they leave it, the camera brings them back to the middle (inside the small settle zone) and rests again.
+	bool zone_mode;
+	float zone_x, zone_y;    // half size of the rest zone, as a fraction of the picture width / height
+	bool zone_moving[2];     // pan, tilt: currently following
+	float zone_anticipation; // 0 = follow after the person, 1 = move with the person
+	float zone_cmd[2];       // what is being asked of the head, as an equivalent position error in pixels
+	float zone_rate[2];      // how fast the camera itself is believed to be sweeping the picture, px/s
+	float zone_v[2];         // the person's own speed (camera motion taken out), px/s
+	float zone_fast_s[2];    // for how long the person has been walking
+	float zone_cmd_lag[2];   // zone_cmd, delayed the way the head eases into a speed
+	float zone_gain[2]; // how strongly the head really answers, compared with what the settings assume (learned)
+	uint64_t zone_gain_log_ns;
 	f3 filter_int;
 	f3 filter_lpf;
 	float f_att_int;
@@ -57,4 +74,31 @@ struct face_tracker_ptz
 	bool is_paused;
 	obs_hotkey_pair_id hotkey_pause;
 	obs_hotkey_id hotkey_reset;
+	obs_hotkey_id hotkey_lock;
+	long long lock_request_seen; // last value of the "lock_request" setting (changed by the phone page)
+	float zone_strength;         // how firmly the person is brought back to the middle (1 = normal)
+	float search_pct[4];         // search area: share of the picture ignored on the left, right, top, bottom (%)
+	float pursuit_s;             // keep turning this long after the person walks out of the picture
+	float zone_last_x[2];        // where the person was, relative to the target point, when last seen (px)
+	float zone_pursuit_left;     // seconds of pursuit remaining
+	float zone_pursuit_cmd;
+	bool pan_only;   // tilt is left where the operator put it
+	float lead_frac; // lead room when walking, as a fraction of the picture width
+	float zone_lead; // lead room in use right now, px (eases in and out)
+
+	// What happened in the last minute, written to the OBS log as one "X70-STATS" line for tuning afterwards.
+	struct stats_s
+	{
+		float t = 0;                      // seconds covered
+		float t_seen = 0;                 // presenter in view
+		float t_moving = 0;               // camera turning
+		float t_pose = 0;                 // head taken from the body pose
+		float off_sum = 0, off_max = 0;   // how far from the framing point, share of the picture width
+		float v_max = 0;                  // fastest the presenter moved, share of the width per second
+		float cmd_max = 0;                // strongest turn asked of the head
+		int lost = 0, chased = 0;         // times lost; times followed out of the picture
+		int lost_edge = 0, lost_fast = 0; // lost near the side of the picture; lost while walking
+		float gone = 0, gone_max = 0;     // how long the current / the longest absence lasted
+		int people_max = 0;
+	} stats;
 };

@@ -15,6 +15,12 @@ option(ENABLE_MONITOR_USER "Enable monitor source for user" OFF)
 option(ENABLE_DEBUG_DATA "Enable property to save error and control data" OFF)
 option(WITH_DOCK "Enable dock" ON)
 option(ENABLE_DATAGEN "Enable generating data" OFF)
+if(WIN32)
+	set(_with_ncnn_default ON)
+else()
+	set(_with_ncnn_default OFF)
+endif()
+option(WITH_NCNN "Whole-person detection with a presenter lock (downloads and builds the ncnn library)" ${_with_ncnn_default})
 
 set(CMAKE_PREFIX_PATH "${QTDIR}")
 
@@ -67,6 +73,7 @@ set(PLUGIN_SOURCES
 	src/face-tracker.cpp
 	src/source_list.cc
 	src/face-tracker-preset.cpp
+	src/presenter-tracker.cpp
 	src/face-tracker-manager.cpp
 	src/face-tracker-ptz.cpp
 	src/face-tracker-monitor.cpp
@@ -91,6 +98,13 @@ if (WITH_DOCK)
 		ui/face-tracker-dock.cpp
 		ui/face-tracker-widget.cpp
 	)
+endif()
+
+if (WITH_NCNN)
+	include(cmake/ncnn.cmake)
+	set(PLUGIN_SOURCES ${PLUGIN_SOURCES} src/face-detector-person.cpp)
+	set(plugin_additional_libs ${plugin_additional_libs} ncnn)
+	add_definitions("-DWITH_NCNN")
 endif()
 
 add_library(${PROJECT_NAME} MODULE ${PLUGIN_SOURCES})
@@ -187,6 +201,13 @@ if(INSTALL_LICENSE_FILES)
 		install(FILES
 			dlib/LICENSE.txt
 			RENAME LICENSE-dlib.txt
+			DESTINATION ${LICENSE_DESTINATION}
+		)
+	endif()
+	if (WITH_NCNN)
+		install(FILES
+			${ncnn_SOURCE_DIR}/LICENSE.txt
+			RENAME LICENSE-ncnn.txt
 			DESTINATION ${LICENSE_DESTINATION}
 		)
 	endif()

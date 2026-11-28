@@ -3,12 +3,14 @@
 #include <deque>
 #include <string>
 #include "face-tracker-base.h"
+#include "presenter-tracker.hpp"
 
 class face_tracker_manager {
 public:
 	enum detector_engine_e {
 		engine_dlib_hog = 0,
 		engine_dlib_cnn = 1,
+		engine_person = 2, // whole-body detection with a presenter lock (needs WITH_NCNN)
 		engine_uninitialized = -1,
 	};
 
@@ -48,6 +50,25 @@ public: // properties
 	std::string detector_dlib_hog_model;
 	std::string detector_dlib_cnn_model;
 	int detector_crop_l, detector_crop_r, detector_crop_t, detector_crop_b;
+	bool detector_upsample = false;
+	float detect_interval = 1.0f; // seconds between detector runs
+	float lock_hold = 6.0f;       // seconds to stay on the current target while the detector cannot confirm it
+	uint64_t target_confirmed_ns = 0;
+	int diag_target_state = 0;
+	// person engine
+	std::string person_model;     // "tiny" (accurate) or "nano" (fast)
+	float person_interval = 0.1f; // seconds between detector runs
+	bool follow_manual = false;   // only the operator chooses who is followed
+	presenter_tracker presenter;
+	double presenter_det_time = 0.0;                // when the picture now in the detector was taken
+	float presenter_vx = 0.0f, presenter_vy = 0.0f; // presenter's speed across the picture, px/s
+	bool pose_on = true;                            // find the presenter's head, shoulders and limbs
+	bool pose_known = false;                        // the framing point comes from the body pose right now
+	float presenter_head = 0.0f;                    // size of the presenter's head, px
+	float presenter_facing = 0.0f;                  // -1 = facing left, 0 = towards the camera, +1 = facing right
+	bool camera_speed_known = false;                // the camera's own movement was measured from the background
+	float camera_vx = 0.0f, camera_vy = 0.0f; // how fast the camera sweeps the picture, px/s (+ = right / down)
+	static bool person_engine_available();
 	char *landmark_detection_data;
 
 public: // realtime status
@@ -69,6 +90,10 @@ public: /* not sure they are necessary to be public */
 private:
 	int next_tick_stage_to_detector;
 	bool detector_in_progress;
+	// diagnostics written to the OBS log
+	int diag_last_faces = -1;
+	int diag_last_tick = 0;
+	uint64_t diag_detect_start_ns = 0;
 
 public:
 	face_tracker_manager();

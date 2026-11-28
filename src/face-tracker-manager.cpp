@@ -1,8 +1,13 @@
+#include <cmath>
+#include <util/platform.h>
 #include <obs-module.h>
 #include "plugin-macros.generated.h"
 #include "face-tracker-manager.hpp"
 #include "face-detector-dlib-hog.h"
 #include "face-detector-dlib-cnn.h"
+#ifdef WITH_NCNN
+#include "face-detector-person.h"
+#endif
 #include "face-tracker-dlib.h"
 #include "texture-object.h"
 #include "helper.hpp"
@@ -16,6 +21,17 @@
 #define DIR_DLIB_HOG "dlib_hog_model"
 #define DIR_DLIB_CNN "dlib_cnn_model"
 #define DIR_DLIB_LANDMARK "dlib_face_landmark_model"
+#define DIR_PERSON "person_model"
+#define DIR_POSE "pose_model"
+
+bool face_tracker_manager::person_engine_available()
+{
+#ifdef WITH_NCNN
+	return true;
+#else
+	return false;
+#endif
+}
 
 face_tracker_manager::face_tracker_manager()
 {
@@ -147,13 +163,119 @@ inline void face_tracker_manager::copy_detector_to_tracker()
 		return;
 
 	if (detect_rects.size() <= 0) {
+		// Nothing detected. The tracker keeps following by itself, but only for 'lock_hold' seconds: after that
+		// it may have drifted off the person, and a camera that holds still is better than one that wanders.
+		if (target_confirmed_ns && os_gettime_ns() - target_confirmed_ns > (uint64_t)(lock_hold * 1e9f)) {
+			bool any = false;
+			for (size_t i = 0; i < trackers.size(); i++) {
+				if (trackers[i].state == tracker_inst_s::tracker_state_available &&
+				    trackers[i].att > 0.0f) {
+					trackers[i].att = 0.0f;
+					any = true;
+				}
+			}
+			if (any || diag_target_state != 3)
+				blog(LOG_INFO, "target: no face seen for %.0f s, released (camera holds)", lock_hold);
+			diag_target_state = 3;
+		}
 		retire_tracker(i_tracker);
 		return;
 	}
 
+	// Decide which detected face to follow. The original code always took the first one in the list, so with two
+	// people in shot, or one false detection, the target could jump. Here the current target is kept: a detection
+	// is used only if it overlaps the face already being tracked. If the detector cannot see the target (the person
+	// turned away), the tracker carries on by itself for 'lock_hold' seconds before another face may take over.
+	const uint64_t now_ns = os_gettime_ns();
+	int i_target = -1;
+	float s_target = 0.0f;
+	for (size_t i = 0; i < trackers.size(); i++) {
+		if (trackers[i].state != tracker_inst_s::tracker_state_available)
+			continue;
+		float s = trackers[i].att * trackers[i].rect.score;
+		if (s > s_target) {
+			s_target = s;
+			i_target = (int)i;
+		}
+	}
+
+	size_t i_largest = 0;
+	for (size_t j = 1; j < detect_rects.size(); j++) {
+		const rect_s &a = detect_rects[j], &b = detect_rects[i_largest];
+		if ((a.x1 - a.x0) * (a.y1 - a.y0) > (b.x1 - b.x0) * (b.y1 - b.y0))
+			i_largest = j;
+	}
+
+	size_t i_pick = i_largest;
+	if (i_target >= 0) {
+		const rect_s &tr = trackers[i_target].rect;
+		int a_min = (tr.x1 - tr.x0) * (tr.y1 - tr.y0) / 10;
+		int j_best = -1;
+		for (size_t j = 0; j < detect_rects.size(); j++) {
+			int a = common_area(detect_rects[j], tr);
+			if (a > a_min) {
+				a_min = a;
+				j_best = (int)j;
+			}
+		}
+		// No overlap: the person may simply have moved faster than the tracker could follow, leaving the tracker
+		// sitting on the background behind them. A detected face is still the same person if it is within the
+		// distance somebody can cover in the time since the target was last confirmed (about 8 face widths per
+		// second, a brisk walk, plus 1.5 face widths of slack).
+		int j_near = -1;
+		float d_near = 0.0f;
+		if (j_best < 0) {
+			float tx = (tr.x0 + tr.x1) * 0.5f, ty = (tr.y0 + tr.y1) * 0.5f;
+			float dt_s = target_confirmed_ns ? (float)(now_ns - target_confirmed_ns) * 1e-9f : 0.0f;
+			for (size_t j = 0; j < detect_rects.size(); j++) {
+				const rect_s &d = detect_rects[j];
+				float dx = (d.x0 + d.x1) * 0.5f - tx, dy = (d.y0 + d.y1) * 0.5f - ty;
+				float dist = sqrtf(dx * dx + dy * dy);
+				float reach = (float)(d.x1 - d.x0) * (1.5f + 8.0f * dt_s);
+				if (dist <= reach && (j_near < 0 || dist < d_near)) {
+					j_near = (int)j;
+					d_near = dist;
+				}
+			}
+		}
+		if (j_best >= 0) {
+			i_pick = (size_t)j_best;
+			if (diag_target_state != 1)
+				blog(LOG_INFO, "target: confirmed by the detector");
+			diag_target_state = 1;
+		} else if (j_near >= 0) {
+			i_pick = (size_t)j_near;
+			blog(LOG_INFO, "target: tracker fell behind, re-attached to the face %d px away", (int)d_near);
+			diag_target_state = 1;
+			for (size_t i = 0; i < trackers.size(); i++) {
+				if (i != i_tracker && trackers[i].state == tracker_inst_s::tracker_state_available)
+					trackers[i].att = 0.0f;
+			}
+		} else if (now_ns - target_confirmed_ns < (uint64_t)(lock_hold * 1e9f)) {
+			if (diag_target_state != 2)
+				blog(LOG_INFO, "target: %d other face(s) seen, staying on the current target",
+				     (int)detect_rects.size());
+			diag_target_state = 2;
+			retire_tracker(i_tracker);
+			return;
+		} else {
+			blog(LOG_INFO, "target: not confirmed for %.0f s, switching to the largest face", lock_hold);
+			diag_target_state = 1;
+			for (size_t i = 0; i < trackers.size(); i++) {
+				if (i != i_tracker && trackers[i].state == tracker_inst_s::tracker_state_available)
+					trackers[i].att = 0.0f;
+			}
+		}
+	} else {
+		if (diag_target_state != 1)
+			blog(LOG_INFO, "target: acquired (largest of %d face(s))", (int)detect_rects.size());
+		diag_target_state = 1;
+	}
+	target_confirmed_ns = now_ns;
+
 	struct tracker_inst_s &t = trackers[i_tracker];
 
-	struct rect_s r = detect_rects[0];
+	struct rect_s r = detect_rects[i_pick];
 	int w = r.x1 - r.x0;
 	int h = r.y1 - r.y0;
 	r.x0 -= w * upsize_l;
@@ -177,8 +299,49 @@ inline void face_tracker_manager::stage_to_detector()
 		for (size_t i = 0; i < detect_rects.size(); i++)
 			debug_detect("stage_to_detector: detect_rects %d %d %d %d %d %f", i, detect_rects[i].x0,
 				     detect_rects[i].y0, detect_rects[i].x1, detect_rects[i].y1, detect_rects[i].score);
-		attenuate_tracker();
-		copy_detector_to_tracker();
+		// Diagnostics: report what the detector found whenever the count changes, and about every 20 s.
+		if ((int)detect_rects.size() != diag_last_faces || tick_cnt - diag_last_tick > 600) {
+			int ms = (int)((os_gettime_ns() - diag_detect_start_ns) / 1000000);
+			if (detect_rects.size() > 0) {
+				const auto &r = detect_rects[0];
+				blog(LOG_INFO, "detector: %d %s; first is %dx%d px at (%d,%d) score %.2f; about %d ms",
+				     (int)detect_rects.size(),
+				     detector_engine == engine_person ? "person(s)" : "face(s)", r.x1 - r.x0,
+				     r.y1 - r.y0, r.x0, r.y0, r.score, ms);
+			} else {
+				blog(LOG_INFO, "detector: no face found; took about %d ms; %d tracker(s) active", ms,
+				     (int)tracker_rects.size());
+			}
+			diag_last_faces = (int)detect_rects.size();
+			diag_last_tick = tick_cnt;
+		}
+		if (detector_engine == engine_person) {
+#ifdef WITH_NCNN
+			// The presenter lock replaces the per-face trackers: any that are left over are retired.
+			for (size_t i = 0; i < trackers.size(); i++)
+				trackers[i].att = 0.0f;
+			attenuate_tracker();
+			if (auto *d = dynamic_cast<face_detector_person *>(detect)) {
+				std::vector<pt_det> persons;
+				d->get_persons(persons);
+				presenter.lock_hold = lock_hold;
+				presenter.manual = follow_manual;
+				presenter.update(persons, presenter_det_time);
+				float bx, by;
+				camera_speed_known = d->get_background_speed(bx, by);
+				camera_vx = camera_speed_known ? -bx
+							       : 0.0f; // background slides left = camera turns right
+				camera_vy = camera_speed_known ? -by : 0.0f;
+				std::string ev = presenter.take_event();
+				if (!ev.empty())
+					blog(LOG_INFO, "%s; detection takes about %d ms (of which body pose %d ms)",
+					     ev.c_str(), d->last_ms(), d->last_pose_ms());
+			}
+#endif
+		} else {
+			attenuate_tracker();
+			copy_detector_to_tracker();
+		}
 		detector_in_progress = false;
 	}
 
@@ -192,13 +355,45 @@ inline void face_tracker_manager::stage_to_detector()
 		if (detector_engine == engine_dlib_hog) {
 			if (auto *d = dynamic_cast<face_detector_dlib_hog *>(detect))
 				d->set_model(detector_dlib_hog_model.c_str());
+			if (auto *d = dynamic_cast<face_detector_dlib_hog *>(detect))
+				d->set_upsample(detector_upsample);
 		} else if (detector_engine == engine_dlib_cnn) {
 			if (auto *d = dynamic_cast<face_detector_dlib_cnn *>(detect))
 				d->set_model(detector_dlib_cnn_model.c_str());
 		}
+#ifdef WITH_NCNN
+		if (detector_engine == engine_person) {
+			if (auto *d = dynamic_cast<face_detector_person *>(detect)) {
+				const char *name = person_model == "nano" ? "yolox_nano" : "yolox_tiny";
+				char *fp = obs_module_file((std::string(DIR_PERSON "/") + name + ".param").c_str());
+				char *fb = obs_module_file((std::string(DIR_PERSON "/") + name + ".bin").c_str());
+				d->set_model(fp ? fp : "", fb ? fb : "");
+				bfree(fp);
+				bfree(fb);
+			}
+			presenter_det_time = (double)os_gettime_ns() * 1e-9;
+			if (auto *d = dynamic_cast<face_detector_person *>(detect)) {
+				d->set_time(presenter_det_time);
+				// body pose of the presenter, where they are expected in this picture
+				float hx0 = 0, hy0 = 0, hx1 = 0, hy1 = 0;
+				const bool have = presenter.predict(presenter_det_time, hx0, hy0, hx1, hy1);
+				char *fp = obs_module_file(DIR_POSE "/movenet_lightning.param");
+				char *fb = obs_module_file(DIR_POSE "/movenet_lightning.bin");
+				d->set_pose(fp ? fp : "", fb ? fb : "", pose_on && have && fp && fb, hx0, hy0, hx1,
+					    hy1);
+				bfree(fp);
+				bfree(fb);
+			}
+		}
+#endif
 		detect->signal();
+		diag_detect_start_ns = os_gettime_ns();
 		detector_in_progress = true;
 		detect_tick = tick_cnt;
+		if (detector_engine == engine_person) { // no per-face tracker in this mode
+			detect->unlock();
+			return;
+		}
 
 		struct tracker_inst_s t;
 		t.rect = rect_s{0, 0, 0, 0, 0.0f};
@@ -328,14 +523,60 @@ void face_tracker_manager::tick(float second)
 		for (int i = trackers.size() - 1; i >= 0; i--)
 			trackers[i].att = 0.0f;
 		detect_rects.clear();
+		presenter.reset();
 		reset_requested = false;
 	}
 
+	const float interval = detector_engine == engine_person ? person_interval : detect_interval;
 	if (detect_tick == tick_cnt)
-		next_tick_stage_to_detector = tick_cnt + (int)(2.0f / second); // detect for each _ second(s).
+		next_tick_stage_to_detector = tick_cnt + (int)(interval / second);
 
 	tick_cnt += 1;
 
+	if (detector_engine == engine_person) {
+		// One target: the presenter, where the motion model says they are right now. The camera frames the
+		// head, taken as the top of the body box.
+		// With the body pose known, the head is where the pose says it is: this stays right when an arm is
+		// raised or the person leans, when the top and the middle of the box are no longer the head.
+		float x0, y0, x1, y1;
+		const double t_now = (double)os_gettime_ns() * 1e-9;
+		if (presenter.predict(t_now, x0, y0, x1, y1)) {
+			const float bw = x1 - x0, bh = y1 - y0;
+			float head = std::min(bh / 7.0f, bw * 0.45f);
+			if (head < 8.0f)
+				head = 8.0f;
+			// the head's size changes slowly, and not at all while a raised hand stretches the box
+			if (presenter_head <= 0.0f)
+				presenter_head = head;
+			else if (!presenter.arms_up(t_now))
+				presenter_head += (head - presenter_head) * std::min(1.0f, second / 1.0f);
+			head = presenter_head;
+			float cx = (x0 + x1) * 0.5f, top = y0;
+			float hx, hy;
+			pose_known = pose_on && presenter.head_point(t_now, hx, hy);
+			if (pose_known) {
+				cx = hx;
+				top = hy - head * 0.55f; // the point is the middle of the face
+			}
+			presenter_facing = pose_known ? presenter.facing(t_now) : 0.0f;
+			tracker_rects.resize(1);
+			auto &r = tracker_rects[0];
+			r.rect = rect_s{(int)(cx - head * 0.5f), (int)top, (int)(cx + head * 0.5f), (int)(top + head),
+					1.0f};
+			r.crop_rect = crop_cur;
+			r.landmark.clear();
+		} else {
+			tracker_rects.clear();
+			presenter_head = 0.0f;
+			pose_known = false;
+			presenter_facing = 0.0f;
+		}
+		presenter.velocity(presenter_vx, presenter_vy);
+		return;
+	}
+
+	presenter_vx = presenter_vy = 0.0f;
+	camera_speed_known = false;
 	make_tracker_rects(tracker_rects, trackers);
 }
 
@@ -360,11 +601,22 @@ static void update_detector(face_tracker_manager *ftm, enum face_tracker_manager
 	case face_tracker_manager::engine_dlib_cnn:
 		ftm->detect = new face_detector_dlib_cnn();
 		break;
+	case face_tracker_manager::engine_person:
+#ifdef WITH_NCNN
+		ftm->detect = new face_detector_person();
+#else
+		blog(LOG_WARNING, "person detection is not part of this build; using the face detector instead");
+		ftm->detect = new face_detector_dlib_hog();
+		detector_engine = face_tracker_manager::engine_dlib_hog;
+#endif
+		break;
 	default:
 		blog(LOG_ERROR, "unknown detector_engine %d", (int)detector_engine);
 	}
 
 	ftm->detector_engine = detector_engine;
+	ftm->presenter.reset();
+	ftm->reset_requested = true;
 
 	if (ftm->detect)
 		ftm->detect->start();
@@ -378,14 +630,29 @@ void face_tracker_manager::update(obs_data_t *settings)
 	upsize_b = obs_data_get_double(settings, "upsize_b");
 	scale = obs_data_get_double(settings, "scale");
 	auto _detector_engine = (enum detector_engine_e)obs_data_get_int(settings, "detector_engine");
+	if (_detector_engine == engine_person && !person_engine_available())
+		_detector_engine = engine_dlib_hog;
 	if (_detector_engine != detector_engine)
 		update_detector(this, _detector_engine);
+	person_model = obs_data_get_string(settings, "person_model");
+	follow_manual = strcmp(obs_data_get_string(settings, "follow_mode"), "manual") == 0;
+	pose_on = obs_data_get_bool(settings, "pose");
+	person_interval = (float)obs_data_get_double(settings, "person_interval");
+	if (person_interval < 0.05f)
+		person_interval = 0.05f;
 	detector_dlib_hog_model = obs_data_get_string(settings, "detector_dlib_hog_model");
 	detector_dlib_cnn_model = obs_data_get_string(settings, "detector_dlib_cnn_model");
 	detector_crop_l = obs_data_get_int(settings, "detector_crop_l");
 	detector_crop_r = obs_data_get_int(settings, "detector_crop_r");
 	detector_crop_t = obs_data_get_int(settings, "detector_crop_t");
 	detector_crop_b = obs_data_get_int(settings, "detector_crop_b");
+	detector_upsample = obs_data_get_bool(settings, "detector_upsample");
+	detect_interval = (float)obs_data_get_double(settings, "detect_interval");
+	if (detect_interval < 0.2f)
+		detect_interval = 0.2f;
+	lock_hold = (float)obs_data_get_double(settings, "lock_hold");
+	if (lock_hold < 1.0f)
+		lock_hold = 1.0f;
 	bool landmark_detection = obs_data_get_bool(settings, "landmark_detection");
 	bfree(landmark_detection_data);
 	landmark_detection_data = NULL;
@@ -410,13 +677,17 @@ void face_tracker_manager::get_properties(obs_properties_t *pp)
 	obs_property_t *p;
 	std::string data_path = obs_get_module_data_path(obs_current_module());
 
-	obs_properties_add_float(pp, "upsize_l", obs_module_text("Left"), -0.4, 4.0, 0.2);
-	obs_properties_add_float(pp, "upsize_r", obs_module_text("Right"), -0.4, 4.0, 0.2);
-	obs_properties_add_float(pp, "upsize_t", obs_module_text("Top"), -0.4, 4.0, 0.2);
-	obs_properties_add_float(pp, "upsize_b", obs_module_text("Bottom"), -0.4, 4.0, 0.2);
-	obs_properties_add_float(pp, "scale", obs_module_text("Scale image"), 1.0, 16.0, 1.0);
+	obs_properties_add_float(pp, "upsize_l", obs_module_text("Face box padding: left"), -0.4, 4.0, 0.2);
+	obs_properties_add_float(pp, "upsize_r", obs_module_text("Face box padding: right"), -0.4, 4.0, 0.2);
+	obs_properties_add_float(pp, "upsize_t", obs_module_text("Face box padding: top"), -0.4, 4.0, 0.2);
+	obs_properties_add_float(pp, "upsize_b", obs_module_text("Face box padding: bottom"), -0.4, 4.0, 0.2);
+	obs_properties_add_float(
+		pp, "scale", obs_module_text("Shrink picture before analysing (1 = finds smaller faces, 2 = less CPU)"),
+		1.0, 16.0, 1.0);
 	p = obs_properties_add_list(pp, "detector_engine", obs_module_text("Detector"), OBS_COMBO_TYPE_LIST,
 				    OBS_COMBO_FORMAT_INT);
+	if (person_engine_available())
+		obs_property_list_add_int(p, obs_module_text("Whole person (recommended)"), (int)engine_person);
 	obs_property_list_add_int(p, obs_module_text("Detector.dlib.hog"), (int)engine_dlib_hog);
 	obs_property_list_add_int(p, obs_module_text("Detector.dlib.cnn"), (int)engine_dlib_cnn);
 	obs_properties_add_path(pp, "detector_dlib_hog_model", obs_module_text("Dlib HOG model"), OBS_PATH_FILE,
@@ -427,10 +698,41 @@ void face_tracker_manager::get_properties(obs_properties_t *pp)
 				"Data Files (*.dat);;"
 				"All Files (*.*)",
 				(data_path + "/" DIR_DLIB_CNN).c_str());
-	obs_properties_add_int(pp, "detector_crop_l", obs_module_text("Crop left for detector"), 0, 1920, 1);
-	obs_properties_add_int(pp, "detector_crop_r", obs_module_text("Crop right for detector"), 0, 1920, 1);
-	obs_properties_add_int(pp, "detector_crop_t", obs_module_text("Crop top for detector"), 0, 1080, 1);
-	obs_properties_add_int(pp, "detector_crop_b", obs_module_text("Crop bottom for detector"), 0, 1080, 1);
+	p = obs_properties_add_int(pp, "detector_crop_l", obs_module_text("Search area: ignore this much on the left"),
+				   0, 1920, 1);
+	obs_property_int_set_suffix(p, " px");
+	p = obs_properties_add_int(pp, "detector_crop_r", obs_module_text("Search area: ignore this much on the right"),
+				   0, 1920, 1);
+	obs_property_int_set_suffix(p, " px");
+	p = obs_properties_add_int(pp, "detector_crop_t", obs_module_text("Search area: ignore this much at the top"),
+				   0, 1080, 1);
+	obs_property_int_set_suffix(p, " px");
+	p = obs_properties_add_int(pp, "detector_crop_b",
+				   obs_module_text("Search area: ignore this much at the bottom"), 0, 1080, 1);
+	obs_property_int_set_suffix(p, " px");
+	p = obs_properties_add_list(pp, "follow_mode", obs_module_text("Who to follow"), OBS_COMBO_TYPE_LIST,
+				    OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(p, obs_module_text("Automatic: the biggest person in the search area"), "auto");
+	obs_property_list_add_string(p, obs_module_text("Manual: only the person I lock on, never anybody else"),
+				     "manual");
+	obs_property_set_long_description(
+		p, obs_module_text("Manual: aim the camera so the person is on the yellow cross and press the Lock "
+				   "button (or its hotkey). The camera then stays with that person. If they leave "
+				   "the picture it waits for them, and never picks somebody else by itself."));
+	p = obs_properties_add_list(pp, "person_model", obs_module_text("Person detection quality"),
+				    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(p, obs_module_text("Accurate (default)"), "tiny");
+	obs_property_list_add_string(p, obs_module_text("Fast (weaker PC, bigger person in the picture)"), "nano");
+	p = obs_properties_add_float(pp, "person_interval", obs_module_text("Look for the person every"), 0.05, 1.0,
+				     0.05);
+	obs_property_float_set_suffix(p, " s");
+	obs_properties_add_bool(pp, "detector_upsample", obs_module_text("Find small faces (HOG only, more CPU)"));
+	p = obs_properties_add_float(pp, "detect_interval", obs_module_text("Detect every"), 0.2, 5.0, 0.1);
+	obs_property_float_set_suffix(p, " s");
+	p = obs_properties_add_float(pp, "lock_hold",
+				     obs_module_text("Stay on the same person when the face is hidden, for"), 1.0, 60.0,
+				     1.0);
+	obs_property_float_set_suffix(p, " s");
 	obs_properties_add_bool(pp, "landmark_detection", obs_module_text("Enable landmark detection"));
 	p = obs_properties_add_path(pp, "landmark_detection_data", obs_module_text("Landmark detection data"),
 				    OBS_PATH_FILE,
@@ -453,6 +755,12 @@ void face_tracker_manager::get_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, "upsize_t", 0.3);
 	obs_data_set_default_double(settings, "upsize_b", 0.1);
 	obs_data_set_default_double(settings, "scale", 2.0);
+	obs_data_set_default_double(settings, "detect_interval", 1.0);
+	obs_data_set_default_double(settings, "lock_hold", 6.0);
+	obs_data_set_default_string(settings, "person_model", "tiny");
+	obs_data_set_default_double(settings, "person_interval", 0.1);
+	obs_data_set_default_bool(settings, "pose", true);
+	obs_data_set_default_string(settings, "follow_mode", "auto");
 	obs_data_set_default_bool(settings, "tracking_th_en", true);
 	obs_data_set_default_double(settings, "tracking_th_dB", -80.0);
 

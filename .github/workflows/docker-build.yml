@@ -19,6 +19,8 @@ env:
 
 jobs:
   docker_build:
+    # Fedora packages are not built in this fork (Windows, OBS 33 only).
+    if: ${{ github.repository != 'bigmes-rgb/obs-face-tracker' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

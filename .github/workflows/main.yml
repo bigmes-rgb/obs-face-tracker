@@ -24,10 +24,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - obs: 30
-            ubuntu: 'ubuntu-22.04'
-          - obs: 31
-            ubuntu: 'ubuntu-24.04'
+          # This fork builds for OBS 33 only (that is what the church PC runs).
           - obs: 33
             ubuntu: 'ubuntu-26.04'
     defaults:
@@ -109,6 +106,8 @@ jobs:
             logs/*
 
   macos_build:
+    # macOS is not built in this fork (Windows, OBS 33 only).
+    if: ${{ github.repository != 'bigmes-rgb/obs-face-tracker' }}
     runs-on: macos-26
     strategy:
       fail-fast: false
@@ -294,16 +293,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - obs: 30
-            arch: 'x64'
-            runner: 'windows-2022'
-            obs-onsdriver: '< 33'
           - obs: 33
             arch: 'x64'
             runner: 'windows-2025-vs2026'
-          - obs: 33
-            arch: 'arm64'
-            runner: 'windows-11-arm'
     env:
       Configuration: 'RelWithDebInfo'
     defaults:
@@ -386,28 +378,23 @@ jobs:
     steps:
       - name: 'Publish release'
         run: |
-          gh run download ${{ github.run_id }} --repo ${{ github.repository }} -n artifact-windows-obs30-x64 -D a30
           gh run download ${{ github.run_id }} --repo ${{ github.repository }} -n artifact-windows-obs33-x64 -D a33
-          cp a30/*Installer.exe FaceTracker-X70-for-OBS-30-31-32.exe
           cp a33/*Installer.exe FaceTracker-X70-for-OBS-33.exe
           cat > notes.md <<'NOTES'
-          Modified Face Tracker plugin for the X70 pan/tilt head. Windows only.
+          Tracking plugin for the X70 pan/tilt head. Windows, OBS 33.
 
-          **Which file**
-          - OBS 30, 31 or 32: `FaceTracker-X70-for-OBS-30-31-32.exe`
-          - OBS 33: `FaceTracker-X70-for-OBS-33.exe`
+          **Install:** close OBS, run `FaceTracker-X70-for-OBS-33.exe`, reopen OBS. Windows may warn about an unknown publisher (More info, then Run anyway).
 
-          **Install:** close OBS, run the installer, reopen OBS. Windows may warn about an unknown publisher (More info, then Run anyway).
+          **What it does**
+          - Follows the whole person, not the face, so the presenter is not lost when turning away
+          - Presenter lock: one target, motion prediction, clothing colours to tell people apart
+          - Zone framing: rests while the person is near the middle, travels with them when they walk
+          - Measures the camera's own movement from the background and adjusts itself to the head
 
-          **Changes from the original plugin**
-          - Tracking rate limit (default 12 per second) to cut CPU use
-          - Timeout and reconnect on the camera link, so a lost reply no longer stops tracking
-          - Keep-alive while the head is moving
-
-          Based on norihiro/obs-face-tracker (GPL-2.0). Source: the `low-cpu` branch of this repository.
+          Based on norihiro/obs-face-tracker (GPL-2.0). Person detection: YOLOX (Apache-2.0) run by ncnn (BSD-3-Clause). Source: the `low-cpu` branch of this repository.
           NOTES
           gh release create "x70-${{ github.run_number }}" --repo ${{ github.repository }} \
             --target "${{ github.event.pull_request.head.sha }}" \
             --title "Face Tracker for the X70 head (build ${{ github.run_number }})" \
             --notes-file notes.md --latest \
-            FaceTracker-X70-for-OBS-30-31-32.exe FaceTracker-X70-for-OBS-33.exe
+            FaceTracker-X70-for-OBS-33.exe

@@ -77,4 +77,9 @@ struct face_tracker_ptz
 	obs_hotkey_id hotkey_lock;
 	long long lock_request_seen; // last value of the "lock_request" setting (changed by the phone page)
 	float zone_strength;         // how firmly the person is brought back to the middle (1 = normal)
+	float search_pct[4];         // search area: share of the picture ignored on the left, right, top, bottom (%)
+	float pursuit_s;             // keep turning this long after the person walks out of the picture
+	float zone_last_x[2];        // where the person was, relative to the target point, when last seen (px)
+	float zone_pursuit_left;     // seconds of pursuit remaining
+	float zone_pursuit_cmd;
 };

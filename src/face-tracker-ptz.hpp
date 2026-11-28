@@ -82,4 +82,6 @@ struct face_tracker_ptz
 	float zone_last_x[2];        // where the person was, relative to the target point, when last seen (px)
 	float zone_pursuit_left;     // seconds of pursuit remaining
 	float zone_pursuit_cmd;
+	float lead_frac; // lead room when walking, as a fraction of the picture width
+	float zone_lead; // lead room in use right now, px (eases in and out)
 };

@@ -218,6 +218,7 @@ static void ftptz_update(void *data, obs_data_t *settings)
 	s->search_pct[2] = (float)obs_data_get_double(settings, "search_t_pct");
 	s->search_pct[3] = (float)obs_data_get_double(settings, "search_b_pct");
 	s->pursuit_s = (float)obs_data_get_double(settings, "pursuit_s");
+	s->lead_frac = (float)obs_data_get_double(settings, "lead_pct") * 0.01f;
 
 	s->ki.v[0] = (float)obs_data_get_double(settings, "Ki_x");
 	s->ki.v[1] = (float)obs_data_get_double(settings, "Ki_y");
@@ -533,6 +534,13 @@ static obs_properties_t *ftptz_properties(void *data)
 						    obs_module_text("Head: distance from the left"), 20.0, 80.0, 1.0);
 		obs_property_float_set_suffix(p, " % of the width");
 		obs_property_set_long_description(p, obs_module_text("50 % = centred."));
+		p = obs_properties_add_float_slider(pp, "lead_pct", obs_module_text("Lead room while walking"), 0.0,
+						    15.0, 1.0);
+		obs_property_float_set_suffix(p, " % of the width");
+		obs_property_set_long_description(
+			p, obs_module_text(
+				   "While the person walks, they are framed this far behind the middle, leaving "
+				   "space in front of them. It eases back to the middle when they stop. 0 = off."));
 		obs_properties_add_group(props, "g_frame",
 					 obs_module_text("2. Framing    (yellow cross = where the head goes)"),
 					 OBS_GROUP_NORMAL, pp);
@@ -800,6 +808,7 @@ static void ftptz_get_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, "search_t_pct", 0.0);
 	obs_data_set_default_double(settings, "search_b_pct", 28.0);
 	obs_data_set_default_double(settings, "pursuit_s", 2.0);
+	obs_data_set_default_double(settings, "lead_pct", 5.0);
 	obs_data_set_default_double(settings, "zone_x", 10.0);
 	obs_data_set_default_double(settings, "zone_y", 10.0);
 	obs_data_set_default_double(settings, "zone_anticipation", 1.0);
@@ -1064,6 +1073,17 @@ static void tick_filter(struct face_tracker_ptz *s, float second)
 			}
 
 			const float v_walk = 0.06f * size, v_still = 0.02f * size;
+
+			// Lead room: a walking person is framed a little behind the middle, so there is space in front
+			// of them, the way an operator frames a walk. It eases in as they walk and out when they stop.
+			if (i == 0) {
+				float want = 0.0f;
+				if (s->face_found)
+					want = s->lead_frac * size *
+					       std::max(-1.0f, std::min(1.0f, s->zone_v[0] / (0.15f * size)));
+				s->zone_lead += (want - s->zone_lead) * std::min(1.0f, second / 0.8f);
+				x += s->zone_lead;
+			}
 			if (std::abs(s->zone_v[i]) > v_walk)
 				s->zone_fast_s[i] += second;
 			else

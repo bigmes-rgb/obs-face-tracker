@@ -36,8 +36,16 @@ struct face_tracker_ptz
 	// Zone framing: the camera rests while the presenter is inside the rest zone around the target point. When
 	// they leave it, the camera brings them back to the middle (inside the small settle zone) and rests again.
 	bool zone_mode;
-	float zone_x, zone_y; // half size of the rest zone, as a fraction of the picture width / height
-	bool zone_moving[2];  // pan, tilt: currently bringing the presenter back
+	float zone_x, zone_y;    // half size of the rest zone, as a fraction of the picture width / height
+	bool zone_moving[2];     // pan, tilt: currently following
+	float zone_anticipation; // 0 = follow after the person, 1 = move with the person
+	float zone_cmd[2];       // what is being asked of the head, as an equivalent position error in pixels
+	float zone_rate[2];      // how fast the camera itself is believed to be sweeping the picture, px/s
+	float zone_v[2];         // the person's own speed (camera motion taken out), px/s
+	float zone_fast_s[2];    // for how long the person has been walking
+	float zone_cmd_lag[2];   // zone_cmd, delayed the way the head eases into a speed
+	float zone_gain[2]; // how strongly the head really answers, compared with what the settings assume (learned)
+	uint64_t zone_gain_log_ns;
 	f3 filter_int;
 	f3 filter_lpf;
 	float f_att_int;

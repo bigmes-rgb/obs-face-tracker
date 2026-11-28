@@ -3,9 +3,9 @@
 #include <algorithm>
 #include <cmath>
 #include <vector>
+#include <net.h>
 #include <dlib/pixel.h>
 #include <dlib/matrix.h>
-#include <net.h>
 #include "presenter-tracker.hpp"
 
 #define PD_INPUT_SIZE 416 // the network's input, pixels square
@@ -48,10 +48,113 @@ static inline void pd_clothing_signature(const dlib::matrix<dlib::rgb_pixel> &im
 	d.has_sig = true;
 }
 
+// ---- How much the camera itself moved between two analysed pictures -------------------------------------------
+// When the camera pans or tilts, the whole background slides across the picture. Measuring that slide tells us how
+// fast the camera is really turning, with no feedback from the head and no calibration. The picture is cut into
+// horizontal bands (for left/right) and vertical strips (for up/down); each one votes for a shift and the middle
+// vote wins, so the person walking through some of the bands does not disturb the result.
+#define PD_EGO_BANDS 6
+
+struct pd_ego_state
+{
+	std::vector<float> col[PD_EGO_BANDS], row[PD_EGO_BANDS];
+	int tw = 0, th = 0;
+	bool have = false;
+};
+
+// Best shift of 'cur' against 'prev' (cur[x] = prev[x - shift]), in samples. Returns false when the profile has
+// no clear match (a plain wall, for example).
+static inline bool pd_profile_shift(const std::vector<float> &prev, const std::vector<float> &cur, int max_shift,
+				    float &shift)
+{
+	const int n = (int)cur.size();
+	if (n < 32 || (int)prev.size() != n)
+		return false;
+	std::vector<float> sad(2 * max_shift + 1);
+	int best = 0;
+	float sum = 0.0f;
+	for (int sft = -max_shift; sft <= max_shift; sft++) {
+		const int x0 = std::max(1, 1 + sft), x1 = std::min(n - 1, n - 1 + sft);
+		float a = 0.0f;
+		for (int x = x0; x < x1; x++)
+			a += fabsf((cur[x + 1] - cur[x - 1]) - (prev[x - sft + 1] - prev[x - sft - 1]));
+		a /= (float)std::max(1, x1 - x0);
+		sad[sft + max_shift] = a;
+		sum += a;
+		if (a < sad[best])
+			best = sft + max_shift;
+	}
+	const float mean = sum / (float)sad.size();
+	if (mean <= 1e-3f || sad[best] > 0.6f * mean)
+		return false;
+	float sub = 0.0f;
+	if (best > 0 && best < (int)sad.size() - 1) {
+		const float l = sad[best - 1], c = sad[best], r = sad[best + 1];
+		const float den = l - 2.0f * c + r;
+		if (den > 1e-6f)
+			sub = 0.5f * (l - r) / den;
+	}
+	shift = (float)(best - max_shift) + sub;
+	return true;
+}
+
+// img: the picture as fed to the network (3 channels, tw x th valid pixels). Returns the background's movement
+// since the previous call, in pixels of img.
+static inline bool pd_ego_motion(pd_ego_state &st, const ncnn::Mat &img, int tw, int th, float &dx, float &dy)
+{
+	std::vector<float> col[PD_EGO_BANDS], row[PD_EGO_BANDS];
+	const float *c0 = img.channel(0), *c1 = img.channel(1), *c2 = img.channel(2);
+	const int stride = img.w;
+	for (int b = 0; b < PD_EGO_BANDS; b++) {
+		col[b].assign(tw, 0.0f);
+		row[b].assign(th, 0.0f);
+	}
+	for (int y = 0; y < th; y++) {
+		const int by = std::min(PD_EGO_BANDS - 1, y * PD_EGO_BANDS / th);
+		for (int x = 0; x < tw; x++) {
+			const int i = y * stride + x;
+			const float g = c0[i] + c1[i] + c2[i];
+			col[by][x] += g;
+			row[std::min(PD_EGO_BANDS - 1, x * PD_EGO_BANDS / tw)][y] += g;
+		}
+	}
+	bool ok = false;
+	if (st.have && st.tw == tw && st.th == th) {
+		float vx[PD_EGO_BANDS], vy[PD_EGO_BANDS];
+		int nx = 0, ny = 0;
+		for (int b = 0; b < PD_EGO_BANDS; b++) {
+			float s;
+			if (pd_profile_shift(st.col[b], col[b], tw / 5, s))
+				vx[nx++] = s;
+			if (pd_profile_shift(st.row[b], row[b], th / 5, s))
+				vy[ny++] = s;
+		}
+		if (nx >= 3 && ny >= 3) {
+			std::sort(vx, vx + nx);
+			std::sort(vy, vy + ny);
+			dx = vx[nx / 2];
+			dy = vy[ny / 2];
+			ok = true;
+		}
+	}
+	for (int b = 0; b < PD_EGO_BANDS; b++) {
+		st.col[b].swap(col[b]);
+		st.row[b].swap(row[b]);
+	}
+	st.tw = tw;
+	st.th = th;
+	st.have = true;
+	return ok;
+}
+
 // Finds the people inside the search area (cx0..cy1, in pixels of img). The boxes are returned in the coordinates
 // of the full-size picture (img is 1/scale of it).
+// If 'ego' is given, 'ego_ok' / 'ego_dx' / 'ego_dy' report how far the background moved since the previous call, in
+// pixels of the full-size picture.
 static inline bool person_detect_core(ncnn::Net &net, const dlib::matrix<dlib::rgb_pixel> &img, int cx0, int cy0,
-				      int cx1, int cy1, float scale, std::vector<pt_det> &result)
+				      int cx1, int cy1, float scale, std::vector<pt_det> &result,
+				      pd_ego_state *ego = nullptr, bool *ego_ok = nullptr, float *ego_dx = nullptr,
+				      float *ego_dy = nullptr)
 {
 	const int cw = cx1 - cx0, ch = cy1 - cy0;
 	// Fit the search area into the network's square input, keeping its shape (grey bars fill the rest).
@@ -60,6 +163,12 @@ static inline bool person_detect_core(ncnn::Net &net, const dlib::matrix<dlib::r
 	const unsigned char *pixels = (const unsigned char *)&img(cy0, cx0);
 	ncnn::Mat resized =
 		ncnn::Mat::from_pixels_resize(pixels, ncnn::Mat::PIXEL_RGB2BGR, cw, ch, (int)img.nc() * 3, tw, th);
+	if (ego && ego_ok && ego_dx && ego_dy) {
+		float dx = 0.0f, dy = 0.0f;
+		*ego_ok = pd_ego_motion(*ego, resized, tw, th, dx, dy);
+		*ego_dx = dx / r * scale;
+		*ego_dy = dy / r * scale;
+	}
 	ncnn::Mat padded;
 	ncnn::copy_make_border(resized, padded, 0, PD_INPUT_SIZE - th, 0, PD_INPUT_SIZE - tw, ncnn::BORDER_CONSTANT,
 			       114.0f);

@@ -50,6 +50,9 @@ public:
 	// Where the presenter is at time t. Returns false when there is nobody to follow (camera should hold).
 	bool predict(double t, float &x0, float &y0, float &x1, float &y1) const;
 
+	// How fast the presenter is moving across the picture, pixels per second (0 when nobody is being followed).
+	void velocity(float &vx, float &vy) const;
+
 	state_e state() const { return st; }
 	// One line for the log each time something worth knowing happened; empty otherwise.
 	std::string take_event();

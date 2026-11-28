@@ -325,6 +325,11 @@ inline void face_tracker_manager::stage_to_detector()
 				d->get_persons(persons);
 				presenter.lock_hold = lock_hold;
 				presenter.update(persons, presenter_det_time);
+				float bx, by;
+				camera_speed_known = d->get_background_speed(bx, by);
+				camera_vx = camera_speed_known ? -bx
+							       : 0.0f; // background slides left = camera turns right
+				camera_vy = camera_speed_known ? -by : 0.0f;
 				std::string ev = presenter.take_event();
 				if (!ev.empty())
 					blog(LOG_INFO, "%s; detection takes about %d ms", ev.c_str(), d->last_ms());
@@ -364,6 +369,8 @@ inline void face_tracker_manager::stage_to_detector()
 				bfree(fb);
 			}
 			presenter_det_time = (double)os_gettime_ns() * 1e-9;
+			if (auto *d = dynamic_cast<face_detector_person *>(detect))
+				d->set_time(presenter_det_time);
 		}
 #endif
 		detect->signal();
@@ -532,9 +539,12 @@ void face_tracker_manager::tick(float second)
 		} else {
 			tracker_rects.clear();
 		}
+		presenter.velocity(presenter_vx, presenter_vy);
 		return;
 	}
 
+	presenter_vx = presenter_vy = 0.0f;
+	camera_speed_known = false;
 	make_tracker_rects(tracker_rects, trackers);
 }
 

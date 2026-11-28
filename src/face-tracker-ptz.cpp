@@ -205,6 +205,7 @@ static void ftptz_update(void *data, obs_data_t *settings)
 	s->zone_mode = obs_data_get_bool(settings, "zone_mode");
 	s->zone_x = (float)obs_data_get_double(settings, "zone_x") * 1e-2f;
 	s->zone_y = (float)obs_data_get_double(settings, "zone_y") * 1e-2f;
+	s->zone_anticipation = (float)obs_data_get_double(settings, "zone_anticipation");
 	s->e_deadband.v[0] = (float)obs_data_get_double(settings, "e_deadband_x") * 1e-2;
 	s->e_deadband.v[1] = (float)obs_data_get_double(settings, "e_deadband_y") * 1e-2;
 	s->e_deadband.v[2] = (float)obs_data_get_double(settings, "e_deadband_z") * 1e-2;
@@ -278,6 +279,7 @@ static void emit_state_changed(struct face_tracker_ptz *);
 static void *ftptz_create(obs_data_t *settings, obs_source_t *context)
 {
 	auto *s = (struct face_tracker_ptz *)bzalloc(sizeof(struct face_tracker_ptz));
+	s->zone_gain[0] = s->zone_gain[1] = 1.0f;
 	s->ftm = new ft_manager_for_ftptz(s);
 	s->ftm->crop_cur.x1 = s->ftm->crop_cur.y1 = -2;
 	s->context = context;
@@ -512,6 +514,13 @@ static obs_properties_t *ftptz_properties(void *data)
 		p = obs_properties_add_float_slider(pp, "zone_y", obs_module_text("Rest zone, up and down"), 2.0, 40.0,
 						    1.0);
 		obs_property_float_set_suffix(p, " % of the height");
+		p = obs_properties_add_float_slider(pp, "zone_anticipation", obs_module_text("Move with the person"),
+						    0.0, 1.2, 0.05);
+		obs_property_set_long_description(
+			p, obs_module_text("0 = the camera only follows after the person has moved. 1 = when the "
+					   "person walks, the camera travels with them at their speed. If the camera "
+					   "runs ahead of the person or swings, lower it. Needs the Whole person "
+					   "detector."));
 		p = obs_properties_add_float_slider(pp, "e_deadband_x", obs_module_text("Still zone, left and right"),
 						    0.0, 20.0, 0.5);
 		obs_property_float_set_suffix(p, " %");
@@ -637,6 +646,7 @@ static void ftptz_get_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "zone_mode", true);
 	obs_data_set_default_double(settings, "zone_x", 10.0);
 	obs_data_set_default_double(settings, "zone_y", 10.0);
+	obs_data_set_default_double(settings, "zone_anticipation", 1.0);
 	if (face_tracker_manager::person_engine_available()) {
 		obs_data_set_default_int(settings, "detector_engine", (int)face_tracker_manager::engine_person);
 		obs_data_set_default_double(settings, "scale", 2.0); // a whole person is big: half size is plenty
@@ -838,22 +848,67 @@ static void tick_filter(struct face_tracker_ptz *s, float second)
 	for (int i = 0; i < 3; i++) {
 		float x = e.v[i];
 		if (s->zone_mode && i < 2) {
-			// Rest until the presenter leaves the rest zone, then bring them all the way back to the middle.
-			const float outer = i == 0 ? s->zone_x * (float)s->known_width
-						   : s->zone_y * (float)s->known_height;
+			// Zone framing, the way a camera operator works:
+			//  - small movements near the middle are ignored (rest zone);
+			//  - when the person walks, the camera starts moving WITH them, at their speed, without waiting
+			//    for them to reach the edge of the zone;
+			//  - when they stop, the camera eases them back to the middle and rests.
+			const float size = i == 0 ? (float)s->known_width : (float)s->known_height;
+			const float outer = (i == 0 ? s->zone_x : s->zone_y) * size;
 			const float inner = outer * 0.3f;
-			if (!s->face_found)
-				s->zone_moving[i] = false;
-			else if (!s->zone_moving[i] && std::abs(x) > outer)
-				s->zone_moving[i] = true;
-			else if (s->zone_moving[i] && std::abs(x) < inner)
-				s->zone_moving[i] = false;
-			if (!s->zone_moving[i]) {
-				x = 0.0f;
-				s->filter_int.v[i] = 0.0f;
+			const float K = 1.0f; // 1/s: the response the speed settings are designed for
+			// The person's own speed is what the detector sees plus what the camera's movement takes away.
+			// The camera's movement is measured from the background sliding across the picture. If that
+			// cannot be measured (a plain wall), it is estimated from what was asked of the head.
+			const float v_seen = i == 0 ? s->ftm->presenter_vx : s->ftm->presenter_vy;
+			const bool measured = s->ftm->camera_speed_known;
+			s->zone_rate[i] += (K * s->zone_gain[i] * s->zone_cmd[i] - s->zone_rate[i]) *
+					   std::min(1.0f, second / 0.2f);
+			const float v_camera = measured ? (i == 0 ? s->ftm->camera_vx : s->ftm->camera_vy)
+							: s->zone_rate[i];
+			s->zone_v[i] += (v_seen + v_camera - s->zone_v[i]) * std::min(1.0f, second / 0.25f);
+			if (s->ftm->detector_engine != face_tracker_manager::engine_person)
+				s->zone_v[i] = 0.0f; // the face detectors give no speed: plain zone framing
+
+			// Learn how strongly the head really answers. The speed settings assume a calibrated head; if
+			// it turns out faster or slower, the commands are scaled so the camera still behaves the same.
+			s->zone_cmd_lag[i] += (s->zone_cmd[i] - s->zone_cmd_lag[i]) * std::min(1.0f, second / 0.45f);
+			if (measured && std::abs(s->zone_cmd_lag[i]) > 0.03f * size &&
+			    std::abs(v_camera) > 0.02f * size) {
+				float g = v_camera / (K * s->zone_cmd_lag[i]);
+				g = std::max(0.2f, std::min(5.0f, g));
+				s->zone_gain[i] += (g - s->zone_gain[i]) * std::min(1.0f, second / 1.5f);
 			}
-			e_int.v[i] = x;
-			e.v[i] = x;
+
+			const float v_walk = 0.06f * size, v_still = 0.02f * size;
+			if (std::abs(s->zone_v[i]) > v_walk)
+				s->zone_fast_s[i] += second;
+			else
+				s->zone_fast_s[i] = 0.0f;
+
+			if (!s->face_found) {
+				s->zone_moving[i] = false;
+				s->zone_v[i] = 0.0f;
+				s->zone_fast_s[i] = 0.0f;
+			} else if (!s->zone_moving[i] && (std::abs(x) > outer || s->zone_fast_s[i] > 0.3f)) {
+				s->zone_moving[i] = true;
+			} else if (s->zone_moving[i] && std::abs(x) < inner && std::abs(s->zone_v[i]) < v_still) {
+				s->zone_moving[i] = false;
+			}
+
+			float cmd = 0.0f;
+			if (s->zone_moving[i]) {
+				// position: bring the person to the middle. speed: travel with them. Without a measured
+				// camera speed the second part is only an estimate, so it is used at half strength.
+				const float ff = s->zone_anticipation * (measured ? 1.0f : 0.5f);
+				cmd = (K * x + ff * s->zone_v[i]) / (K * s->zone_gain[i]);
+				const float cmd_max = 0.6f * size;
+				cmd = std::max(-cmd_max, std::min(cmd_max, cmd));
+			}
+			s->zone_cmd[i] = cmd;
+			s->filter_int.v[i] = 0.0f;
+			e_int.v[i] = 0.0f;
+			e.v[i] = 0.0f;
 			continue;
 		}
 		float d = srwh * s->e_deadband.v[i];
@@ -897,6 +952,19 @@ static void tick_filter(struct face_tracker_ptz *s, float second)
 		for (int i = 0; i < 3; i++)
 			uf.v[i] = (e.v[i] + s->filter_int.v[i]) * second +
 				  (s->filter_lpf.v[i] - filter_lpf_prev.v[i]) * s->klpf.v[i];
+	}
+	if (s->zone_mode) {
+		for (int i = 0; i < 2; i++)
+			uf.v[i] = s->face_found ? s->zone_cmd[i] * second : 0.0f;
+		const uint64_t now_ns = os_gettime_ns();
+		if (now_ns - s->zone_gain_log_ns > 60000000000ULL &&
+		    (std::abs(s->zone_gain[0] - 1.0f) > 0.25f || std::abs(s->zone_gain[1] - 1.0f) > 0.25f)) {
+			s->zone_gain_log_ns = now_ns;
+			blog(LOG_INFO,
+			     "camera response measured: pan %.2f, tilt %.2f of what the speed settings assume "
+			     "(1.00 = calibrated; commands are adjusted to match)",
+			     s->zone_gain[0], s->zone_gain[1]);
+		}
 	}
 	s->face_found_last = s->face_found;
 	const float kp_zoom = std::max(s->ptz_query[2], 1.0f);

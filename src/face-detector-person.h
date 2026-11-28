@@ -17,5 +17,9 @@ public:
 	void get_faces(std::vector<struct rect_s> &) override; // the person boxes, for drawing
 	void get_persons(std::vector<pt_det> &);
 	void set_model(const char *param_file, const char *bin_file);
+	void set_time(double t); // when the picture handed over with set_texture was taken, in seconds
+	// How fast the background slid across the picture between the last two analysed pictures (px/s). This is the
+	// camera's own movement. False when it could not be measured.
+	bool get_background_speed(float &vx, float &vy);
 	int last_ms();
 };

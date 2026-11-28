@@ -1,3 +1,14 @@
+// ncnn has to come before the OBS headers on Windows: it needs the complete Windows threading API, which a later
+// include would otherwise narrow down.
+#ifdef _WIN32
+#undef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#endif
+#include "person-detect-core.hpp"
+
 #include <obs-module.h>
 #include <util/platform.h>
 #include <util/threading.h>
@@ -7,8 +18,6 @@
 #include "plugin-macros.generated.h"
 #include "face-detector-person.h"
 #include "texture-object.h"
-
-#include "person-detect-core.hpp"
 
 #define MAX_ERROR 2
 
@@ -23,6 +32,10 @@ struct face_detector_person_private_s
 	int crop_l = 0, crop_r = 0, crop_t = 0, crop_b = 0;
 	int n_error = 0;
 	int last_ms = 0;
+	pd_ego_state ego;
+	double t_frame = 0.0, t_prev = 0.0; // when the picture being analysed, and the one before, were taken
+	bool ego_ok = false;
+	float ego_vx = 0.0f, ego_vy = 0.0f; // background movement, px/s of the full-size picture
 };
 
 face_detector_person::face_detector_person()
@@ -52,6 +65,18 @@ void face_detector_person::set_model(const char *param_file, const char *bin_fil
 		p->bin_file = bin_file;
 		p->net_loaded = false;
 	}
+}
+
+void face_detector_person::set_time(double t)
+{
+	p->t_frame = t;
+}
+
+bool face_detector_person::get_background_speed(float &vx, float &vy)
+{
+	vx = p->ego_vx;
+	vy = p->ego_vy;
+	return p->ego_ok;
 }
 
 int face_detector_person::last_ms()
@@ -107,7 +132,18 @@ void face_detector_person::detect_main()
 	}
 
 	std::vector<pt_det> keep;
-	if (!person_detect_core(p->net, img, cx0, cy0, cx1, cy1, scale, keep)) {
+	bool ego_ok = false;
+	float ego_dx = 0.0f, ego_dy = 0.0f;
+	const bool ran =
+		person_detect_core(p->net, img, cx0, cy0, cx1, cy1, scale, keep, &p->ego, &ego_ok, &ego_dx, &ego_dy);
+	const float dt = (float)(p->t_frame - p->t_prev);
+	p->ego_ok = ego_ok && dt > 0.02f && dt < 1.0f;
+	if (p->ego_ok) {
+		p->ego_vx = ego_dx / dt;
+		p->ego_vy = ego_dy / dt;
+	}
+	p->t_prev = p->t_frame;
+	if (!ran) {
 		if (p->n_error++ < MAX_ERROR)
 			blog(LOG_ERROR, "person detector: the network gave no result");
 		p->persons.clear();

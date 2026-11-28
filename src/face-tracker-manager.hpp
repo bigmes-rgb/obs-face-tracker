@@ -59,7 +59,10 @@ public: // properties
 	std::string person_model;      // "tiny" (accurate) or "nano" (fast)
 	float person_interval = 0.15f; // seconds between detector runs
 	presenter_tracker presenter;
-	double presenter_det_time = 0.0; // when the picture now in the detector was taken
+	double presenter_det_time = 0.0;                // when the picture now in the detector was taken
+	float presenter_vx = 0.0f, presenter_vy = 0.0f; // presenter's speed across the picture, px/s
+	bool camera_speed_known = false;                // the camera's own movement was measured from the background
+	float camera_vx = 0.0f, camera_vy = 0.0f; // how fast the camera sweeps the picture, px/s (+ = right / down)
 	static bool person_engine_available();
 	char *landmark_detection_data;
 

@@ -266,6 +266,16 @@ bool presenter_tracker::predict(double t, float &x0, float &y0, float &x1, float
 	return true;
 }
 
+void presenter_tracker::velocity(float &vx, float &vy) const
+{
+	if (st == st_locked || st == st_coast) {
+		vx = cx.v;
+		vy = top.v;
+	} else {
+		vx = vy = 0.0f;
+	}
+}
+
 std::string presenter_tracker::take_event()
 {
 	std::string e;

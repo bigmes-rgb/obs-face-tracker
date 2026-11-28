@@ -1,3 +1,4 @@
+#include <cmath>
 #include <util/platform.h>
 #include <obs-module.h>
 #include "plugin-macros.generated.h"
@@ -203,11 +204,39 @@ inline void face_tracker_manager::copy_detector_to_tracker()
 				j_best = (int)j;
 			}
 		}
+		// No overlap: the person may simply have moved faster than the tracker could follow, leaving the tracker
+		// sitting on the background behind them. A detected face is still the same person if it is within the
+		// distance somebody can cover in the time since the target was last confirmed (about 8 face widths per
+		// second, a brisk walk, plus 1.5 face widths of slack).
+		int j_near = -1;
+		float d_near = 0.0f;
+		if (j_best < 0) {
+			float tx = (tr.x0 + tr.x1) * 0.5f, ty = (tr.y0 + tr.y1) * 0.5f;
+			float dt_s = target_confirmed_ns ? (float)(now_ns - target_confirmed_ns) * 1e-9f : 0.0f;
+			for (size_t j = 0; j < detect_rects.size(); j++) {
+				const rect_s &d = detect_rects[j];
+				float dx = (d.x0 + d.x1) * 0.5f - tx, dy = (d.y0 + d.y1) * 0.5f - ty;
+				float dist = sqrtf(dx * dx + dy * dy);
+				float reach = (float)(d.x1 - d.x0) * (1.5f + 8.0f * dt_s);
+				if (dist <= reach && (j_near < 0 || dist < d_near)) {
+					j_near = (int)j;
+					d_near = dist;
+				}
+			}
+		}
 		if (j_best >= 0) {
 			i_pick = (size_t)j_best;
 			if (diag_target_state != 1)
 				blog(LOG_INFO, "target: confirmed by the detector");
 			diag_target_state = 1;
+		} else if (j_near >= 0) {
+			i_pick = (size_t)j_near;
+			blog(LOG_INFO, "target: tracker fell behind, re-attached to the face %d px away", (int)d_near);
+			diag_target_state = 1;
+			for (size_t i = 0; i < trackers.size(); i++) {
+				if (i != i_tracker && trackers[i].state == tracker_inst_s::tracker_state_available)
+					trackers[i].att = 0.0f;
+			}
 		} else if (now_ns - target_confirmed_ns < (uint64_t)(lock_hold * 1e9f)) {
 			if (diag_target_state != 2)
 				blog(LOG_INFO, "target: %d other face(s) seen, staying on the current target",
